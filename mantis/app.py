@@ -114,11 +114,18 @@ class MantisApp:
         return "openai-compatible"
 
     def _select_model_profile(self) -> ModelProfile:
-        configured = self.config.get("model")
+        configured = (
+            self.config.get("model")
+            or os.environ.get("MANTIS_MODEL")
+        )
         if configured:
             for model in self.router.list_models():
                 if model.name == configured:
                     return model
+        # Prefer the first model added (the user-configured one) over routing
+        models = self.router.list_models()
+        if models:
+            return models[0]
         complexity = self.config.get("complexity", "medium")
         return self.router.route(complexity)
 
