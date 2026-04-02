@@ -1,169 +1,155 @@
-<!-- README.md -->
-
 # MantisAI
 
-**Open source agent OS that turns any LLM into a coding agent**
+> Agent OS for any OpenAI-compatible LLM.
+> Route cheap models, give them real tools, and turn them into a coding agent.
+> On low-cost providers, short tool loops can get close to $0.001/task.
 
-```
-pip install mantisai
-export MANTIS_API_KEY=sk-...
+```bash
+git clone https://github.com/Miles0sage/mantis-ai.git
+cd mantis-ai
+pip install -e .
 mantisai chat
 ```
 
----
+## 30-Second Demo
 
-## Architecture
+Hero demo: scan Polymarket for mispriced contracts.
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                           CLI                                │
-│                     mantisai chat                            │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-                    ┌──────▼──────┐
-                    │ QueryEngine │
-                    └──────┬──────┘
-                           │
-              ┌────────────┴────────────┐
-              │                         │
-       ┌──────▼──────┐          ┌──────▼──────┐
-       │ModelAdapter │          │ HookManager │
-       └──────┬──────┘          └─────┬───────┘
-              │                       │
-    ┌─────────┴─────────┐     ┌───────▼────────┐
-    │                   │     │                │
-    ▼                   ▼     ▼                ▼
- GPT-4o            Claude   Pre     Post      Memory
- DeepSeek          Ollama   Hook    Hook
- Qwen              Custom   ▲        ▲
+```text
+$ python demos/prediction_market.py --limit 5
+
+MantisAI — Prediction Market Scanner
+
+Question                                                     Yes     No  Spread   Edge%  Kelly%    Rec
+---------------------------------------------------------------------------------------------------------
+Will ETH be above $4,000 by Friday?                       0.540  0.430   0.030    3.00%   3.09%  WATCH
+Will the Fed cut rates in June?                           0.610  0.350   0.040    4.00%   4.17%  WATCH
+Will Bitcoin hit a new ATH this month?                    0.470  0.470   0.060    6.00%   6.38%    BUY
+---------------------------------------------------------------------------------------------------------
+Scanned: 5 markets | Opportunities: 3 | Best edge: 6.00%
 ```
 
-## Key Features
+The core agent stack gives models built-in tools like `read_file`, `write_file`, `edit_file`, `run_bash`, `glob_files`, and `grep_search` through a single query loop.
 
-- **Any Model**: Works with OpenAI-compatible APIs, local models via Ollama, Claude via Anthropic API
-- **Built-in Tools**: `read`, `write`, `edit`, `bash`, `glob`, `grep` — no extra setup
-- **Skills System**: Extend capabilities with custom skill modules
-- **Hooks**: Pre/post processing at query level for logging, filtering, auth
-- **Memory**: Persistent context across sessions with semantic search
-- **Agent Spawning**: Fork sub-agents for parallel task execution
-- **Cost-Aware Routing**: Automatically selects cheapest capable model for each task
+## Why MantisAI
+
+- **Any model**: point MantisAI at OpenAI, DeepSeek, Alibaba, Ollama, or another OpenAI-compatible endpoint.
+- **Built-in tools**: file read/write/edit, bash, glob, and grep are already wired into the tool registry.
+- **Agent core, not just chat**: the repo includes routing, hooks, memory, skills, and parallel-agent primitives.
 
 ## Quick Start
 
 ```bash
-pip install mantisai
-
+git clone https://github.com/Miles0sage/mantis-ai.git
+cd mantis-ai
+pip install -e .
 export MANTIS_API_KEY=sk-your-key
-# or for Anthropic (Claude):
-export ANTHROPIC_API_KEY=sk-ant-...
-
+export MANTIS_BASE_URL=https://api.openai.com/v1
+export MANTIS_MODEL=gpt-4o-mini
 mantisai chat
 ```
 
-Single-file edit:
+Run one prompt:
+
 ```bash
-mantisai edit src/main.py --instruction "add error handling"
+mantisai run "Summarize the current repository layout"
 ```
 
-Run a task:
+Inspect the configured surface:
+
 ```bash
-mantisai run --task "refactor the auth module"
+mantisai models
+mantisai tools
 ```
 
 ## Supported Models
 
-| Provider | Models |
-|----------|--------|
-| OpenAI | GPT-4o, GPT-4o-mini, GPT-4, o1-preview, o1-mini |
-| Anthropic | Claude 3.5 Sonnet, Claude 3 Opus, Claude 3 Haiku |
-| DeepSeek | DeepSeek Chat, DeepSeek Coder |
-| Alibaba | Qwen 2.5, Qwen Max |
-| MiniMax | MiniMax Text-01 |
-| Ollama | Any local model (llama3, codellama, mistral, etc.) |
-| Custom | Any OpenAI-compatible endpoint |
+Approximate costs are rough reference points for short tool-driven tasks and vary by prompt length and provider pricing.
 
-Set via environment variable:
-```bash
-export MANTIS_MODEL=anthropic/claude-3-5-sonnet-20241022
-export OPENAI_BASE_URL=https://api.deepseek.com/v1  # for compatible APIs
+| Provider | Example model | API style | Approx short task cost |
+| --- | --- | --- | --- |
+| OpenAI | `gpt-4o-mini` | native / compatible | `$0.001-$0.01` |
+| DeepSeek | `deepseek-chat` | compatible | `$0.001-$0.005` |
+| Alibaba | `qwen-plus` | compatible | `$0.001-$0.01` |
+| Anthropic | `claude-3-5-sonnet` | adapter work needed | `$0.01-$0.10` |
+| Ollama | `llama3` | local | hardware-bound |
+| Custom | any compatible model | compatible | depends on endpoint |
+
+## Architecture
+
+```text
+┌──────────────┐
+│   CLI / API  │  mantisai chat | mantisai run
+└──────┬───────┘
+       │
+┌──────▼───────┐
+│  MantisApp   │  config, model selection, tool loading
+└──────┬───────┘
+       │
+┌──────▼───────┐
+│ QueryEngine  │  loop: model -> tool call -> model
+└───┬────┬─────┘
+    │    │
+    │    └──────────────┐
+    │                   │
+┌───▼─────────┐   ┌─────▼─────┐
+│ModelAdapter │   │ToolRegistry│
+└─────────────┘   └─────┬─────┘
+                        │
+              ┌─────────▼─────────┐
+              │ read/write/edit   │
+              │ bash/glob/grep    │
+              └─────────┬─────────┘
+                        │
+              ┌─────────▼─────────┐
+              │ hooks / memory /  │
+              │ skills / spawner  │
+              └───────────────────┘
 ```
+
+## Demos
+
+- `python demos/prediction_market.py` — scan Polymarket for mispriced contracts.
+- `python demos/lead_gen.py "AI startups"` — find leads and draft outreach from public web search.
+- `python demos/sports_analytics.py` — scan for sports odds arbitrage.
+
+See [demos/README.md](demos/README.md) for the full demo commands.
 
 ## Comparison
 
 | Feature | MantisAI | Aider | Claude Code | Goose | Cline |
-|---------|----------|-------|-------------|-------|-------|
-| Any LLM | Yes | Limited | Claude only | Limited | Yes |
-| Local models | Yes | Yes | No | Yes | Yes |
-| Built-in tools | Yes | Yes | Yes | Basic | Yes |
-| Skills system | Yes | No | No | No | Extension |
-| Memory | Yes | No | Session | Limited | No |
-| Hooks | Yes | No | No | No | No |
-| Agent spawning | Yes | No | No | No | No |
-| Cost routing | Yes | No | No | No | No |
-| License | MIT | MIT | Proprietary | MIT | MIT |
+| --- | --- | --- | --- | --- | --- |
+| Any OpenAI-compatible LLM | Yes | Partial | No | Partial | Yes |
+| Built-in file + shell tools | Yes | Yes | Yes | Partial | Yes |
+| Cost-aware routing primitives | Yes | No | No | No | No |
+| Local demos outside coding | Yes | No | No | No | No |
+| Hooks and memory modules | Yes | Limited | Session-only | Limited | Limited |
+| Parallel agent primitives | Experimental | No | No | No | No |
+| MIT license | Yes | Yes | No | Yes | Yes |
 
-## Configuration
+## What Is Real Today
 
-```yaml
-# ~/.mantisai/config.yaml
-model: anthropic/claude-3-5-sonnet-20241022
-max_tokens: 4096
-temperature: 0.7
-tools:
-  - read
-  - write
-  - edit
-  - bash
-  - glob
-  - grep
-hooks:
-  pre:
-    - myhooks.authenticate
-  post:
-    - myhooks.log_response
-memory:
-  provider: sqlite
-  path: ~/.mantisai/memory.db
-```
+- The core library is tested: `20 passed` in the current `tests/test_core.py` suite.
+- Built-in tools, memory store, hooks, skills loader, and model adapter modules all exist in the repo.
+- The CLI now has a working package entrypoint again.
 
-## Skills
+## What Still Needs Work
 
-Create `~/.mantisai/skills/my_skill.py`:
-
-```python
-from mantisai import skill
-
-@skill(name="review", description="Code review with style guide")
-def code_review(file_path: str) -> str:
-    """Review a file and return suggestions."""
-    # implementation
-    return "Found 3 issues..."
-```
-
-Use in conversation:
-```
-/skill review src/app.py
-```
+- The CLI is a thin shell over the core library, not a mature product yet.
+- The Anthropic row above reflects intended support direction; the current adapter is centered on OpenAI-compatible chat APIs.
+- Agent spawning and advanced routing exist as primitives, but they still need deeper end-to-end integration.
 
 ## Contributing
 
-Contributions welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
-
 ```bash
-git clone https://github.com/mantisai/mantisai
-cd mantisai
+git clone https://github.com/Miles0sage/mantis-ai.git
+cd mantis-ai
 pip install -e ".[dev]"
-pytest tests/
+pytest -q
 ```
 
-- Read [ARCHITECTURE.md](ARCHITECTURE.md) for design docs
-- Join [Discord](https://discord.gg/mantisai) for discussion
-- Check [Good First Issues](https://github.com/mantisai/mantisai/labels/good%20first%20issue)
+Small, concrete fixes are the fastest way to move this repo forward: packaging, adapters, demos, and real end-to-end tests.
 
 ## License
 
-MIT License. See [LICENSE](LICENSE).
-
----
-
- Built for developers who want control over their agent stack.
+MIT. See [LICENSE](LICENSE).

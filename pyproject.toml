@@ -24,4 +24,4 @@ dev = [
 ]
 
 [project.scripts]
-mantisai = "mantisai.cli:main"
+mantisai = "mantis.cli:main"

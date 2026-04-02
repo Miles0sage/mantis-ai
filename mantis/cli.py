@@ -231,17 +231,17 @@ def cmd_tools(app: MantisApp) -> int:
 def create_parser() -> argparse.ArgumentParser:
     """Create and configure the argument parser."""
     parser = argparse.ArgumentParser(
-        prog="mantis",
-        description="Mantis AI Agent Framework",
+        prog="mantisai",
+        description="MantisAI CLI",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  mantis chat                              Start interactive REPL
-  mantis run "What is the weather?"         Run single prompt
-  mantis models                             List available models
-  mantis tools                              List available tools
-  mantis run "Analyze this" --model gpt-4   Run with specific model
-  mantis chat --complexity hard            Start chat with high complexity
+  mantisai chat                                Start interactive REPL
+  mantisai run "Summarize this repository"     Run single prompt
+  mantisai models                              List available models
+  mantisai tools                               List available tools
+  mantisai run "Analyze this" --model gpt-4o-mini
+  mantisai chat --complexity hard
         """
     )
     
