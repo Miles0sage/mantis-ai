@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mantisai"
+version = "0.1.0"
+description = "Open source agent OS — orchestrate any LLM as a coding agent"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "MantisAI Contributors"}
+]
+requires-python = ">=3.11"
+dependencies = [
+    "httpx",
+    "pyyaml"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio"
+]
+
+[project.scripts]
+mantisai = "mantisai.cli:main"

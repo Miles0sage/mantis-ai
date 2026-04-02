@@ -1,7 +1,7 @@
 import json
 from typing import Dict, Any, List, Optional
-from openclaw.core.model_adapter import ModelAdapter
-from openclaw.core.tool_registry import ToolRegistry
+from mantis.core.model_adapter import ModelAdapter
+from mantis.core.tool_registry import ToolRegistry
 
 
 class QueryEngine:
@@ -22,7 +22,7 @@ class QueryEngine:
         
         while iteration < self.max_iterations:
             # Get response from LLM
-            response = await self.model_adapter.chat_completion(messages)
+            response = await self.model_adapter.chat(messages, tools=self.tool_registry.list_schemas())
             
             # Track tokens
             input_tokens = response.get("usage", {}).get("prompt_tokens", 0)
@@ -51,7 +51,7 @@ class QueryEngine:
                     raise Exception(f"Invalid JSON in function call arguments: {arguments_str}")
                 
                 # Execute the tool
-                result = await self.tool_registry.execute_tool(name, arguments)
+                result = await self.tool_registry.execute(name, arguments)
                 
                 # Add assistant's tool request and the result to messages
                 messages.append({
@@ -87,7 +87,7 @@ class QueryEngine:
                         raise Exception(f"Invalid JSON in tool call arguments: {arguments_str}")
                     
                     # Execute the tool
-                    result = await self.tool_registry.execute_tool(name, arguments)
+                    result = await self.tool_registry.execute(name, arguments)
                     
                     # Add assistant's tool request and the result to messages
                     messages.append({
