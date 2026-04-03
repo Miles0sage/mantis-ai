@@ -9,8 +9,9 @@ from mantis.core.tool_registry import ToolRegistry
 from mantis.core.context_manager import ContextManager
 from mantis.memory.store import MemoryStore
 from mantis.skills.loader import SkillLoader
-from mantis.core.model_adapter import ModelAdapter
+from mantis.core.model_adapter import BudgetExceededError, ModelAdapter
 from mantis.core.hooks import HookManager, HookResult, Decision
+from mantis.core.router import ModelProfile, ModelRouter
 
 
 class TestToolRegistry:
@@ -52,9 +53,7 @@ class TestToolRegistry:
 
         registry.register("add", "Add two numbers", {"type": "object", "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}}}, add_numbers)
 
-        result = asyncio.get_event_loop().run_until_complete(
-            registry.execute("add", {"a": 5, "b": 3})
-        )
+        result = asyncio.run(registry.execute("add", {"a": 5, "b": 3}))
         assert result == "8"
 
     def test_search_tools(self):
@@ -266,6 +265,117 @@ class TestModelAdapter:
 
         assert adapter.model == "gpt-3.5-turbo"
         assert adapter.api_key == "minimal-key"
+
+    @pytest.mark.asyncio
+    async def test_budget_blocks_request_when_limit_reached(self):
+        adapter = ModelAdapter(
+            base_url="https://api.example.com",
+            api_key="fake-key",
+            model="gpt-4",
+            max_budget_usd=0.001,
+        )
+        adapter._total_cost_usd = 0.001
+        adapter._make_request = AsyncMock()
+
+        with pytest.raises(BudgetExceededError):
+            await adapter.chat([{"role": "user", "content": "hi"}])
+
+        adapter._make_request.assert_not_called()
+
+    def test_register_usage_tracks_remaining_budget(self):
+        adapter = ModelAdapter(
+            base_url="https://api.example.com",
+            api_key="fake-key",
+            model="gpt-4",
+            cost_per_1k_input=1.0,
+            cost_per_1k_output=2.0,
+            max_budget_usd=1.0,
+        )
+
+        adapter._register_usage({"prompt_tokens": 100, "completion_tokens": 200})
+
+        assert adapter.total_input_tokens == 100
+        assert adapter.total_output_tokens == 200
+        assert adapter.total_cost_usd == pytest.approx(0.5)
+        assert adapter.remaining_budget_usd == pytest.approx(0.5)
+
+
+class TestModelRouter:
+    def _make_router(self):
+        router = ModelRouter()
+        router.add_model(
+            ModelProfile(
+                name="cheap",
+                base_url="https://cheap.example/v1",
+                api_key="k",
+                intelligence_score=7,
+                cost_per_1k_input=0.0001,
+                cost_per_1k_output=0.0002,
+                context_window=64000,
+                supports_tools=True,
+                supports_streaming=True,
+            )
+        )
+        router.add_model(
+            ModelProfile(
+                name="mid",
+                base_url="https://mid.example/v1",
+                api_key="k",
+                intelligence_score=10,
+                cost_per_1k_input=0.0004,
+                cost_per_1k_output=0.0008,
+                context_window=128000,
+                supports_tools=True,
+                supports_streaming=True,
+            )
+        )
+        router.add_model(
+            ModelProfile(
+                name="best",
+                base_url="https://best.example/v1",
+                api_key="k",
+                intelligence_score=18,
+                cost_per_1k_input=0.003,
+                cost_per_1k_output=0.015,
+                context_window=200000,
+                supports_tools=True,
+                supports_streaming=True,
+            )
+        )
+        return router
+
+    def test_route_for_plan_uses_cheapest_for_low_scope_docs(self):
+        router = self._make_router()
+        profile = router.route_for_plan(
+            task_type="docs",
+            complexity="low",
+            file_count=0,
+            task_count=1,
+            needs_escalation=False,
+        )
+        assert profile.name == "cheap"
+
+    def test_route_for_plan_uses_best_for_cross_file_code(self):
+        router = self._make_router()
+        profile = router.route_for_plan(
+            task_type="feature",
+            complexity="medium",
+            file_count=2,
+            task_count=1,
+            needs_escalation=False,
+        )
+        assert profile.name == "best"
+
+    def test_route_for_plan_uses_best_for_escalated_work(self):
+        router = self._make_router()
+        profile = router.route_for_plan(
+            task_type="refactor",
+            complexity="high",
+            file_count=1,
+            task_count=2,
+            needs_escalation=True,
+        )
+        assert profile.name == "best"
 
 
 class TestHookManager:

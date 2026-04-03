@@ -62,21 +62,17 @@ class MemorySearch:
         query_lower = query.lower()
         results: list[MemoryIndex] = []
         
-        for key in self.store.list_keys():
+        for memory in self.store.list_all():
             if len(results) >= limit:
                 break
-            
-            memory = self.store.get(key)
-            if memory is None:
-                continue
-            
+
             content_lower = memory.content.lower()
-            
+
             if query_lower in content_lower:
                 snippet = memory.content[:50] if len(memory.content) > 50 else memory.content
-                
+
                 results.append(MemoryIndex(
-                    key=key,
+                    key=memory.key,
                     snippet=snippet,
                     created_at=memory.created_at
                 ))
@@ -94,16 +90,16 @@ class MemorySearch:
             List of MemoryTimeline objects with key, snippet, created_at, and neighbors.
             Each result is approximately ~200 tokens including neighbor context.
         """
-        all_keys = self.store.list_keys()
+        all_keys = [m.key for m in self.store.list_all()]
         key_set = set(keys)
-        
+
         results: list[MemoryTimeline] = []
-        
+
         for key in keys:
-            memory = self.store.get(key)
+            memory = self.store.recall(key)
             if memory is None:
                 continue
-            
+
             neighbors = self._get_neighbors(key, all_keys)
             
             snippet = memory.content[:50] if len(memory.content) > 50 else memory.content
@@ -131,10 +127,10 @@ class MemorySearch:
         results: list[Memory] = []
         
         for key in keys:
-            memory = self.store.get(key)
+            memory = self.store.recall(key)
             if memory is None:
                 continue
-            
+
             results.append(Memory(
                 key=memory.key,
                 content=memory.content,
@@ -267,24 +263,20 @@ class MemorySearch:
         """
         results: list[MemoryIndex] = []
         
-        for key in self.store.list_keys():
+        for memory in self.store.list_all():
             if len(results) >= limit:
                 break
-            
-            memory = self.store.get(key)
-            if memory is None:
-                continue
-            
+
             if start_date and memory.created_at < start_date:
                 continue
-            
+
             if end_date and memory.created_at > end_date:
                 continue
-            
+
             snippet = memory.content[:50] if len(memory.content) > 50 else memory.content
-            
+
             results.append(MemoryIndex(
-                key=key,
+                key=memory.key,
                 snippet=snippet,
                 created_at=memory.created_at
             ))
@@ -301,7 +293,7 @@ class MemorySearch:
         Returns:
             List of Memory objects sorted by creation date (newest first).
         """
-        all_keys = self.store.list_keys()
-        sorted_keys = sorted(all_keys, key=lambda k: self.store.get(k).created_at if self.store.get(k) else datetime.min, reverse=True)
-        
+        all_memories = self.store.list_all()
+        sorted_keys = [m.key for m in sorted(all_memories, key=lambda m: m.created_at, reverse=True)]
+
         return self.recall(sorted_keys[:limit])

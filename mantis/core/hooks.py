@@ -1,3 +1,4 @@
+import asyncio
 import json
 import subprocess
 from dataclasses import dataclass
@@ -125,6 +126,3 @@ class HookManager:
         
         return command_hook
 
-
-# Asyncio is needed for the safe hook runner
-import asyncio

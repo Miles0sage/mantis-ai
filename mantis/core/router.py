@@ -58,6 +58,36 @@ class ModelRouter:
 
         return capable_models[0]
 
+    def route_for_plan(
+        self,
+        task_type: str,
+        complexity: str,
+        file_count: int = 0,
+        task_count: int = 1,
+        needs_escalation: bool = False,
+    ) -> ModelProfile:
+        """Route using execution-plan signals instead of a fixed complexity flag."""
+        if not self.models:
+            raise ValueError("No models registered")
+
+        code_heavy_types = {"feature", "bug_fix", "refactor", "test_writing", "devops", "data"}
+        normalized_task_type = task_type.lower()
+        normalized_complexity = complexity.lower()
+
+        if needs_escalation or normalized_complexity in {"high", "hard"} or task_count >= 3:
+            return self.route_best()
+
+        if file_count >= 2 and normalized_task_type in code_heavy_types:
+            return self.route_best()
+
+        if normalized_complexity == "medium" or file_count == 2:
+            return self.route("medium")
+
+        if normalized_task_type in {"docs", "review", "research", "unknown"}:
+            return self.route_cheapest()
+
+        return self.route_cheapest()
+
     def route_cheapest(self) -> ModelProfile:
         """Pick cheapest model"""
         if not self.models:

@@ -12,10 +12,14 @@ RULES (non-negotiable):
 TOOLS:
 - read_file: inspect code (ALWAYS do this first)
 - edit_file: surgical string replacement in existing files
+- apply_edit: smarter replacement using SEARCH/REPLACE format with fuzzy matching (exact → whitespace-flexible → difflib); prefer this when edit_file fails
 - write_file: create new files only
 - run_bash: execute shell commands
 - glob_files: find files by pattern
 - grep_search: search content across files
+
+SEARCH/REPLACE FORMAT (for apply_edit):
+Use apply_edit when you need tolerant matching. Provide the exact search_text block you want replaced and the replace_text to substitute in. The engine tries exact match first, then flexible whitespace, then fuzzy (0.8 threshold).
 
 WORKFLOW:
 1. Understand: read relevant files, search for context
@@ -69,6 +73,41 @@ You can spawn sub-agents for parallel work.
 - Keep sub-agent prompts self-contained with all needed context
 """
 
+COORDINATOR_ROLE = """
+ROLE: COORDINATOR
+You are coordinating coding work across workers and a verifier.
+- Turn the user request into explicit bounded tasks
+- Keep work cheap by default
+- Only escalate when task coupling or uncertainty is high
+- Prefer clear ownership and explicit verification steps
+- Risky actions must remain visible and reviewable
+"""
+
+WORKER_ROLE = """
+ROLE: WORKER
+You are a focused implementation worker.
+- Solve only the assigned task
+- Read before editing
+- Make the smallest correct change
+- Verify your own work before returning
+- Match the exact requested file names, class names, function names, and method names
+- If the user names a concrete API, do not substitute a similar one
+- If you also generate tests or a check script, the implementation must satisfy those checks deterministically
+- Avoid wall-clock or timing-sensitive behavior when the requested checker uses exact equality, unless the prompt explicitly requires real-time behavior
+- Do not claim success unless the artifact actually matches the request
+"""
+
+VERIFIER_ROLE = """
+ROLE: VERIFIER
+You are an adversarial verifier.
+- Check whether the result actually satisfies the user's request
+- Be strict about interface names, files requested, and verification steps
+- Check concrete artifacts, not just the assistant summary
+- Reject timing-sensitive or nondeterministic implementations when the generated checks expect exact values
+- Return PASS only if the work matches the request, not if it merely looks plausible
+- Call out missing files, wrong APIs, and unverifiable claims
+"""
+
 
 def build_system_prompt(
     project_instructions: str = None,
@@ -100,3 +139,21 @@ def build_system_prompt(
         parts.append(f"AVAILABLE SKILLS:\n{skills_summary}")
 
     return "\n\n".join(parts)
+
+
+def build_role_prompt(
+    role: str,
+    project_instructions: str = None,
+    cost_aware: bool = False,
+) -> str:
+    role_map = {
+        "coordinator": COORDINATOR_ROLE.strip(),
+        "worker": WORKER_ROLE.strip(),
+        "verifier": VERIFIER_ROLE.strip(),
+    }
+    parts = [SYSTEM_PROMPT.strip(), role_map.get(role, "").strip()]
+    if cost_aware:
+        parts.append(COST_AWARE_ROUTING.strip())
+    if project_instructions:
+        parts.append(f"PROJECT INSTRUCTIONS:\n{project_instructions}")
+    return "\n\n".join(part for part in parts if part)

@@ -41,7 +41,18 @@ class ContextManager:
         Returns:
             Estimated token count based on character count divided by 4.
         """
-        total_chars = sum(len(msg["content"]) for msg in self.messages)
+        import json
+        total_chars = 0
+        for msg in self.messages:
+            content = msg.get("content")
+            if content is None:
+                # tool_call messages have no content; serialize the whole message
+                total_chars += len(json.dumps(msg))
+            elif isinstance(content, list):
+                # tool result content may be a list of blocks
+                total_chars += len(json.dumps(content))
+            else:
+                total_chars += len(content)
         return total_chars // 4
 
     def truncate_to_fit(self, reserve_tokens: int = 4096) -> None:

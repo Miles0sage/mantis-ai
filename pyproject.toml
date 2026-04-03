@@ -14,7 +14,9 @@ authors = [
 requires-python = ">=3.11"
 dependencies = [
     "httpx",
-    "pyyaml"
+    "pyyaml",
+    "fastapi",
+    "uvicorn[standard]"
 ]
 
 [project.optional-dependencies]

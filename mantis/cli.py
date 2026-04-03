@@ -228,6 +228,35 @@ def cmd_tools(app: MantisApp) -> int:
         return 1
 
 
+def cmd_serve(host: str, port: int, open_browser: bool) -> int:
+    """Start the MantisAI web dashboard server."""
+    import webbrowser
+    import threading
+    import time
+
+    url = f"http://{host}:{port}"
+    print_system(f"Starting MantisAI dashboard at {url}")
+
+    if open_browser:
+        def _open():
+            time.sleep(1.2)
+            webbrowser.open(url)
+        threading.Thread(target=_open, daemon=True).start()
+
+    try:
+        import uvicorn
+        from mantis.server import app as server_app
+        uvicorn.run(server_app, host=host, port=port, log_level="warning")
+    except ImportError:
+        print_error("fastapi and uvicorn are required: pip install fastapi uvicorn[standard]")
+        return 1
+    except Exception as e:
+        print_error(str(e))
+        return 1
+
+    return 0
+
+
 def create_parser() -> argparse.ArgumentParser:
     """Create and configure the argument parser."""
     parser = argparse.ArgumentParser(
@@ -273,6 +302,12 @@ Examples:
         default=25,
         help="Max agent loop iterations (default: 25)"
     )
+
+    parser.add_argument(
+        "--project-dir",
+        default=None,
+        help="Project directory to look for MANTIS.md (default: current directory)"
+    )
     
     # Subcommands
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
@@ -305,7 +340,29 @@ Examples:
         "tools",
         help="List registered tools"
     )
-    
+
+    # serve command
+    serve_parser = subparsers.add_parser(
+        "serve",
+        help="Start the web dashboard server"
+    )
+    serve_parser.add_argument(
+        "--port",
+        type=int,
+        default=3333,
+        help="Port to listen on (default: 3333)"
+    )
+    serve_parser.add_argument(
+        "--host",
+        default="localhost",
+        help="Host to bind to (default: localhost)"
+    )
+    serve_parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Don't open browser automatically"
+    )
+
     return parser
 
 
@@ -333,7 +390,7 @@ def main() -> int:
     
     # Create MantisApp instance
     try:
-        app = MantisApp(config)
+        app = MantisApp(config, project_dir=args.project_dir)
     except Exception as e:
         print_error(f"Failed to initialize MantisApp: {e}")
         return 1
@@ -348,6 +405,12 @@ def main() -> int:
             return cmd_models(app)
         elif args.command == "tools":
             return cmd_tools(app)
+        elif args.command == "serve":
+            return cmd_serve(
+                host=args.host,
+                port=args.port,
+                open_browser=not args.no_browser,
+            )
         else:
             parser.print_help()
             return 1

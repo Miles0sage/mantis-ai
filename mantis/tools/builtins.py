@@ -9,6 +9,12 @@ import glob
 import fnmatch
 
 from mantis.core.tool_registry import ToolRegistry
+from mantis.memory.store import MemoryStore
+from mantis.memory.search import MemorySearch
+from mantis.tools.edit_applicator import apply_edit as _apply_edit
+
+_memory_store = MemoryStore()
+_memory_search = MemorySearch(_memory_store)
 
 
 async def read_file(file_path: str, offset: int = 0, limit: int = 2000) -> str:
@@ -221,6 +227,65 @@ async def grep_search(pattern: str, path: str = ".", include: str = None) -> str
         return f"Error searching for pattern '{pattern}' in '{path}': {str(e)}"
 
 
+async def apply_edit(file_path: str, search_text: str, replace_text: str) -> dict:
+    """
+    Apply a SEARCH/REPLACE edit to a file using fuzzy matching strategies.
+
+    Args:
+        file_path: Path to the file to edit
+        search_text: Text to search for (exact, flexible whitespace, or fuzzy)
+        replace_text: Text to replace with
+
+    Returns:
+        Dict with keys: success (bool), strategy (str), message (str)
+    """
+    try:
+        success = _apply_edit(file_path, search_text, replace_text)
+        if success:
+            return {
+                "success": True,
+                "strategy": "applied",
+                "message": f"Successfully applied edit to '{file_path}'.",
+            }
+        else:
+            return {
+                "success": False,
+                "strategy": "none",
+                "message": f"Could not find search text in '{file_path}'.",
+            }
+    except FileNotFoundError:
+        return {
+            "success": False,
+            "strategy": "none",
+            "message": f"Error: File '{file_path}' not found.",
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "strategy": "none",
+            "message": f"Error applying edit to '{file_path}': {str(e)}",
+        }
+
+
+async def memory_save(key: str, content: str) -> str:
+    try:
+        _memory_store.save(key, content)
+        return f"Saved memory '{key}'."
+    except Exception as e:
+        return f"Error saving memory '{key}': {str(e)}"
+
+
+async def memory_recall(query: str) -> str:
+    try:
+        results = _memory_search.search(query)
+        if not results:
+            return f"No memories found for query '{query}'."
+        lines = [f"{r.key}: {r.snippet}" for r in results]
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error recalling memories for '{query}': {str(e)}"
+
+
 def register_builtins(registry: ToolRegistry) -> None:
     """
     Register all builtin tools with the provided registry.
@@ -285,9 +350,39 @@ def register_builtins(registry: ToolRegistry) -> None:
         "required": ["pattern"]
     }
     
+    memory_save_schema = {
+        "type": "object",
+        "properties": {
+            "key": {"type": "string", "description": "Key to store the memory under"},
+            "content": {"type": "string", "description": "Content to save"}
+        },
+        "required": ["key", "content"]
+    }
+
+    memory_recall_schema = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Search query to find relevant memories"}
+        },
+        "required": ["query"]
+    }
+
+    apply_edit_schema = {
+        "type": "object",
+        "properties": {
+            "file_path": {"type": "string", "description": "Path to the file to edit"},
+            "search_text": {"type": "string", "description": "Text to search for (supports exact, flexible whitespace, and fuzzy matching)"},
+            "replace_text": {"type": "string", "description": "Text to replace the matched section with"}
+        },
+        "required": ["file_path", "search_text", "replace_text"]
+    }
+
     registry.register("read_file", "Read a file and return its contents with line numbers", read_file_schema, read_file)
     registry.register("write_file", "Write content to a file, creating directories if needed", write_file_schema, write_file)
     registry.register("edit_file", "Replace a string in a file with a new string", edit_file_schema, edit_file)
+    registry.register("apply_edit", "Apply a SEARCH/REPLACE edit using fuzzy matching (exact, whitespace-flexible, or difflib fuzzy)", apply_edit_schema, apply_edit)
     registry.register("run_bash", "Run a shell command and return stdout+stderr", run_bash_schema, run_bash)
     registry.register("glob_files", "Find files matching a glob pattern", glob_files_schema, glob_files)
     registry.register("grep_search", "Search file contents with a regex pattern", grep_search_schema, grep_search)
+    registry.register("memory_save", "Save content to persistent memory under a key", memory_save_schema, memory_save)
+    registry.register("memory_recall", "Search persistent memory and return matching snippets", memory_recall_schema, memory_recall)

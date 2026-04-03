@@ -4,12 +4,21 @@ import httpx
 import json
 
 
+class BudgetExceededError(RuntimeError):
+    pass
+
+
 class ModelAdapter:
-    def __init__(self, base_url: str, api_key: str, model: str, max_tokens: int = 4096):
+    def __init__(self, base_url: str, api_key: str, model: str, max_tokens: int = 4096,
+                 cost_per_1k_input: float = 0.0005, cost_per_1k_output: float = 0.0015,
+                 max_budget_usd: Optional[float] = None):
         self.base_url = base_url.rstrip('/')
         self.api_key = api_key
         self.model = model
         self.max_tokens = max_tokens
+        self.cost_per_1k_input = cost_per_1k_input
+        self.cost_per_1k_output = cost_per_1k_output
+        self.max_budget_usd = max_budget_usd
         self._total_input_tokens = 0
         self._total_output_tokens = 0
         self._total_cost_usd = 0.0
@@ -17,8 +26,51 @@ class ModelAdapter:
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json"
-            }
+            },
+            timeout=120.0,
         )
+
+    def profile_snapshot(self) -> dict:
+        """Capture current provider settings for restore after a per-task swap."""
+        return {
+            "base_url": self.base_url,
+            "api_key": self.api_key,
+            "model": self.model,
+            "cost_per_1k_input": self.cost_per_1k_input,
+            "cost_per_1k_output": self.cost_per_1k_output,
+        }
+
+    def restore_snapshot(self, snapshot: dict) -> None:
+        """Restore provider settings saved by profile_snapshot()."""
+        if snapshot["api_key"] != self.api_key:
+            self.client = httpx.AsyncClient(
+                headers={
+                    "Authorization": f"Bearer {snapshot['api_key']}",
+                    "Content-Type": "application/json",
+                },
+                timeout=120.0,
+            )
+            self.api_key = snapshot["api_key"]
+        self.base_url = snapshot["base_url"].rstrip("/")
+        self.model = snapshot["model"]
+        self.cost_per_1k_input = snapshot["cost_per_1k_input"]
+        self.cost_per_1k_output = snapshot["cost_per_1k_output"]
+
+    def swap_to_profile(self, profile) -> None:
+        """Swap to a different ModelProfile, replacing httpx client if api_key changes."""
+        if profile.api_key != self.api_key:
+            self.client = httpx.AsyncClient(
+                headers={
+                    "Authorization": f"Bearer {profile.api_key}",
+                    "Content-Type": "application/json",
+                },
+                timeout=120.0,
+            )
+            self.api_key = profile.api_key
+        self.base_url = profile.base_url.rstrip("/")
+        self.model = profile.name
+        self.cost_per_1k_input = profile.cost_per_1k_input
+        self.cost_per_1k_output = profile.cost_per_1k_output
 
     @property
     def total_input_tokens(self) -> int:
@@ -31,6 +83,29 @@ class ModelAdapter:
     @property
     def total_cost_usd(self) -> float:
         return self._total_cost_usd
+
+    @property
+    def remaining_budget_usd(self) -> Optional[float]:
+        if self.max_budget_usd is None:
+            return None
+        return max(self.max_budget_usd - self._total_cost_usd, 0.0)
+
+    def _check_budget(self) -> None:
+        if self.max_budget_usd is None:
+            return
+        if self._total_cost_usd >= self.max_budget_usd:
+            raise BudgetExceededError(
+                f"Budget exceeded: ${self._total_cost_usd:.6f} spent of ${self.max_budget_usd:.6f} limit"
+            )
+
+    def _register_usage(self, usage: dict) -> None:
+        input_tokens = usage.get("prompt_tokens", 0)
+        output_tokens = usage.get("completion_tokens", 0)
+        self._total_input_tokens += input_tokens
+        self._total_output_tokens += output_tokens
+        self._total_cost_usd += (input_tokens * self.cost_per_1k_input / 1000) + (
+            output_tokens * self.cost_per_1k_output / 1000
+        )
 
     async def _make_request(self, url: str, payload: dict) -> httpx.Response:
         for attempt in range(1, 4):  # max 3 retries
@@ -57,6 +132,7 @@ class ModelAdapter:
         raise Exception("Unexpected flow - should not reach here")
 
     async def chat(self, messages: List[Dict], tools: List[Dict] = None, temperature: float = 0.7) -> Dict:
+        self._check_budget()
         url = f"{self.base_url}/chat/completions"
         
         payload = {
@@ -72,22 +148,13 @@ class ModelAdapter:
         response = await self._make_request(url, payload)
         result = response.json()
         
-        # Update token counts
         usage = result.get("usage", {})
-        input_tokens = usage.get("prompt_tokens", 0)
-        output_tokens = usage.get("completion_tokens", 0)
-        self._total_input_tokens += input_tokens
-        self._total_output_tokens += output_tokens
-        
-        # Calculate cost (assuming standard pricing - adjust as needed)
-        # Cost is in USD per 1K tokens
-        input_cost_per_1k = 0.0005  # Example pricing
-        output_cost_per_1k = 0.0015  # Example pricing
-        self._total_cost_usd += (input_tokens * input_cost_per_1k / 1000) + (output_tokens * output_cost_per_1k / 1000)
-        
+        self._register_usage(usage)
+
         return result
 
     async def stream(self, messages: List[Dict], tools: List[Dict] = None, tool_choice=None) -> AsyncGenerator:
+        self._check_budget()
         url = f"{self.base_url}/chat/completions"
         
         payload = {
@@ -113,17 +180,7 @@ class ModelAdapter:
                         data = json.loads(data_str)
                         yield data
                         
-                        # Update token counts when usage is available
                         if "usage" in data:
-                            usage = data["usage"]
-                            input_tokens = usage.get("prompt_tokens", 0)
-                            output_tokens = usage.get("completion_tokens", 0)
-                            self._total_input_tokens += input_tokens
-                            self._total_output_tokens += output_tokens
-                            
-                            # Calculate cost (assuming standard pricing - adjust as needed)
-                            input_cost_per_1k = 0.0005  # Example pricing
-                            output_cost_per_1k = 0.0015  # Example pricing
-                            self._total_cost_usd += (input_tokens * input_cost_per_1k / 1000) + (output_tokens * output_cost_per_1k / 1000)
+                            self._register_usage(data["usage"])
                     except json.JSONDecodeError:
                         continue

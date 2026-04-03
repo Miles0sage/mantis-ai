@@ -3,9 +3,10 @@ from typing import List, Dict, Optional
 
 
 class ContextCompressor:
-    def __init__(self, max_tokens: int = 128000, model_adapter=None):
+    def __init__(self, max_tokens: int = 128000, model_adapter=None, use_llm_compaction: bool = False):
         self.max_tokens = max_tokens
         self.model_adapter = model_adapter
+        self.use_llm_compaction = use_llm_compaction
 
     def micro_compact(self, messages: List[Dict]) -> List[Dict]:
         """Replace old tool_result content (keep last 3) with '[Previous: used tool_name]'"""
@@ -129,38 +130,42 @@ class ContextCompressor:
 
     def _generate_summary(self, messages: List[Dict]) -> str:
         """Generate summary of the conversation preserving key elements"""
-        if not self.model_adapter:
-            # Fallback summary if no model adapter provided
+        if not self.use_llm_compaction or not self.model_adapter:
             return self._fallback_summary(messages)
-        
+
         # Construct a prompt to summarize the conversation
-        prompt = """
-Please create a concise summary of this conversation that preserves:
-- Key decisions made
-- Files modified
-- Current task state
-- Important errors encountered
-
-Be brief but comprehensive enough to continue the task effectively.
-
-Conversation:
-"""
-
-        # Add messages to the prompt
+        conversation_text = ""
         for msg in messages:
             role = msg.get("role", "unknown")
             content = msg.get("content", "")
             if isinstance(content, str):
-                prompt += f"\n{role.upper()}: {content}\n"
+                conversation_text += f"\n{role.upper()}: {content}\n"
             else:
-                prompt += f"\n{role.upper()}: {str(content)}\n"
+                conversation_text += f"\n{role.upper()}: {str(content)}\n"
 
-        # Use the model adapter to generate the summary
+        summarize_messages = [
+            {
+                "role": "user",
+                "content": (
+                    "Please create a concise summary of this conversation that preserves:\n"
+                    "- Key decisions made\n"
+                    "- Files modified\n"
+                    "- Current task state\n"
+                    "- Important errors encountered\n\n"
+                    "Be brief but comprehensive enough to continue the task effectively.\n\n"
+                    f"Conversation:\n{conversation_text}"
+                ),
+            }
+        ]
+
         try:
-            response = self.model_adapter.generate(prompt)
-            return response.strip()
+            import asyncio
+            response = asyncio.get_event_loop().run_until_complete(
+                self.model_adapter.chat(summarize_messages)
+            )
+            content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
+            return content.strip() if content else self._fallback_summary(messages)
         except Exception:
-            # Fallback to simple summary if model fails
             return self._fallback_summary(messages)
 
     def _fallback_summary(self, messages: List[Dict]) -> str:
