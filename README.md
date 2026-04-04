@@ -4,7 +4,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-134%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-166%20passing-brightgreen)](tests/)
 
 MantisAI is a self-hosted coding agent built for cheap models first. It runs tasks in the background, pauses for approvals on risky actions, resumes from checkpoints, shows cost and execution state in a web dashboard, and verifies generated artifacts before calling a task done.
 
