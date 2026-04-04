@@ -72,7 +72,7 @@ class MantisApp:
             context_manager=self.context_manager,
             hook_manager=self.hook_manager,
             permission_manager=self.permission_manager,
-            router=self.router,
+            router=None if self._explicit_model_requested else self.router,
         )
 
     def _build_router(self) -> ModelRouter:
@@ -208,6 +208,37 @@ class MantisApp:
             cost_per_1k_output=profile.cost_per_1k_output,
             max_budget_usd=self.config.get("budget_usd"),
         )
+
+    def _build_cheap_worker_adapter(self) -> ModelAdapter:
+        """Build a model adapter for cheap parallel workers.
+
+        Priority: env override → cheapest router profile → fallback to main adapter.
+        Workers only need to execute strict single-file tasks, so cheapest wins.
+        """
+        # Env override for worker model (e.g. Qwen3-coder-plus via Alibaba)
+        worker_model = os.environ.get("MANTIS_WORKER_MODEL")
+        worker_base_url = os.environ.get("MANTIS_WORKER_BASE_URL")
+        worker_api_key = os.environ.get("MANTIS_WORKER_API_KEY")
+
+        if worker_model and worker_base_url and worker_api_key:
+            return ModelAdapter(
+                base_url=worker_base_url,
+                api_key=worker_api_key,
+                model=worker_model,
+                max_tokens=4096,
+                cost_per_1k_input=0.001,
+                cost_per_1k_output=0.001,
+            )
+
+        # Pick cheapest profile from router
+        try:
+            cheapest = min(
+                self.router.models,
+                key=lambda p: p.cost_per_1k_input + p.cost_per_1k_output,
+            )
+            return self._create_model_adapter(cheapest)
+        except (ValueError, AttributeError):
+            return self.model_adapter
 
     def _resolve_model_for_prompt(self, prompt: str) -> tuple[ModelProfile, dict[str, Any]]:
         plan = build_execution_plan(prompt, cwd=self.project_dir)
@@ -354,6 +385,7 @@ class MantisApp:
                 model_adapter=self.model_adapter,
                 tool_registry=self.tool_registry,
                 project_instructions=project_instructions,
+                worker_model_adapter=self._build_cheap_worker_adapter(),
             )
             orchestration = await orchestrator.execute(prompt, plan)
             response = orchestration.output

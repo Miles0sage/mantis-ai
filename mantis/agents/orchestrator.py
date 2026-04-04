@@ -28,11 +28,21 @@ class OrchestrationResult:
 
 
 class CoordinatorOrchestrator:
-    def __init__(self, model_adapter, tool_registry, project_instructions: str | None = None):
+    def __init__(
+        self,
+        model_adapter,
+        tool_registry,
+        project_instructions: str | None = None,
+        worker_model_adapter=None,
+    ):
         self.model_adapter = model_adapter
         self.tool_registry = tool_registry
         self.project_instructions = project_instructions
-        self.spawner = AgentSpawner(model_adapter=model_adapter, tool_registry=tool_registry)
+        self.spawner = AgentSpawner(
+            model_adapter=model_adapter,
+            tool_registry=tool_registry,
+            worker_model_adapter=worker_model_adapter,
+        )
 
     async def execute(self, prompt: str, plan: ExecutionPlan) -> OrchestrationResult:
         worker_outputs = await self._run_workers(plan)
@@ -101,7 +111,8 @@ class CoordinatorOrchestrator:
             "Use verdict pass or fail only.\n\n"
             f"Original request:\n{prompt}\n\n"
             f"Artifact summary:\n{artifact_summary}\n\n"
-            f"Implementation output:\n{output}"
+            f"Implementation output:\n{output}\n\n"
+            "Remember: Return ONLY JSON, no other text."
         )
         response = await self.model_adapter.chat(
             [

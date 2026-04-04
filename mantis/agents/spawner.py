@@ -22,9 +22,16 @@ class AgentResult:
 
 
 class AgentSpawner:
-    def __init__(self, model_adapter: ModelAdapter, tool_registry: ToolRegistry):
+    def __init__(
+        self,
+        model_adapter: ModelAdapter,
+        tool_registry: ToolRegistry,
+        worker_model_adapter: ModelAdapter | None = None,
+    ):
         self.model_adapter = model_adapter
         self.tool_registry = tool_registry
+        # Worker adapter uses a cheaper model; falls back to main adapter if not set
+        self.worker_model_adapter = worker_model_adapter or model_adapter
         self._active_agents: Dict[str, asyncio.Task] = {}
         self._agent_results: Dict[str, AgentResult] = {}
 
@@ -39,14 +46,27 @@ class AgentSpawner:
             max_budget_usd=self.model_adapter.max_budget_usd,
         )
 
+    def _clone_worker_adapter(self) -> ModelAdapter:
+        src = self.worker_model_adapter
+        return ModelAdapter(
+            base_url=src.base_url,
+            api_key=src.api_key,
+            model=src.model,
+            max_tokens=src.max_tokens,
+            cost_per_1k_input=src.cost_per_1k_input,
+            cost_per_1k_output=src.cost_per_1k_output,
+            max_budget_usd=src.max_budget_usd,
+        )
+
     async def spawn(self, task: str, system_prompt: str | None = None, agent_id: str | None = None) -> AgentResult:
         if agent_id is None:
             agent_id = f"subagent_{int(time.time() * 1000)}"
 
         start_time = time.time()
         query_engine = QueryEngine(
-            model_adapter=self._clone_model_adapter(),
+            model_adapter=self._clone_worker_adapter(),
             tool_registry=self.tool_registry,
+            max_iterations=8,
             context_manager=ContextManager(max_tokens=128000),
             hook_manager=HookManager(),
             permission_manager=PermissionManager(mode="yolo"),
