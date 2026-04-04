@@ -124,14 +124,19 @@ def _split_atomic_chunks(prompt: str) -> list[tuple[str, bool]]:
         cleaned.append((stripped, depends_on_previous))
         depends_on_previous = False
 
-    # Merge back fragments (< 3 words, no action verb) into previous chunk.
-    # Prevents "type hints" or "a docstring" from becoming solo tasks.
-    _ACTION = re.compile(r"\b(write|add|implement|build|create|fix|refactor|run|test|update|generate|remove|delete|deploy|read|check|find|make|use|include)\b", re.IGNORECASE)
+    # Merge back any chunk that has no primary action verb — it's a complement
+    # or modifier, not a standalone task. This handles both short fragments
+    # ("type hints") and longer ones ("docstrings to /tmp/math_utils.py").
+    # "use" and "include" are intentionally excluded: they modify a task, not drive one.
+    _ACTION = re.compile(
+        r"\b(write|add|implement|build|create|fix|refactor|run|test|update|generate|"
+        r"remove|delete|deploy|read|check|find|make)\b",
+        re.IGNORECASE,
+    )
     merged: list[tuple[str, bool]] = []
     for chunk, dep in cleaned:
-        words = chunk.split()
-        if merged and len(words) < 3 and not _ACTION.search(chunk):
-            # Append as continuation of previous chunk
+        if merged and not _ACTION.search(chunk):
+            # No primary action verb → append as continuation of previous chunk
             prev_chunk, prev_dep = merged[-1]
             merged[-1] = (prev_chunk + " and " + chunk, prev_dep)
         else:
