@@ -68,7 +68,8 @@ class JobStore:
             return None
         for key, value in fields.items():
             setattr(job, key, value)
-        job.updated_at = utc_now_iso()
+        if "updated_at" not in fields:
+            job.updated_at = utc_now_iso()
         self.save(job)
         return job
 
