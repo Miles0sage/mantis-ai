@@ -5,6 +5,7 @@ import json
 import os
 import asyncio
 import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
 
@@ -17,7 +18,22 @@ from pydantic import BaseModel
 # App setup
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="MantisAI", version="0.1.0")
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """Start VIGIL watchdog on startup, stop on shutdown."""
+    from mantis.core.job_store import JobStore
+    from mantis.core.vigil import Vigil
+    job_store = JobStore()
+    vigil = Vigil(job_store)
+    task = asyncio.create_task(vigil.run())
+    try:
+        yield
+    finally:
+        vigil.stop()
+        task.cancel()
+
+
+app = FastAPI(title="MantisAI", version="0.1.0", lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,

@@ -1,6 +1,18 @@
 import asyncio
 import json
 import subprocess
+
+def _parse_tool_arguments(arguments_str: str) -> dict:
+    """Parse tool call arguments JSON, with repair fallback for malformed output."""
+    try:
+        return json.loads(arguments_str)
+    except json.JSONDecodeError:
+        try:
+            from json_repair import repair_json
+            repaired = repair_json(arguments_str)
+            return json.loads(repaired)
+        except Exception:
+            raise Exception(f"Invalid JSON in tool call arguments: {arguments_str[:200]}...")
 from pathlib import Path
 from typing import AsyncGenerator, Dict, Any, List, Optional
 from mantis.core.model_adapter import ModelAdapter
@@ -9,7 +21,6 @@ from mantis.core.planner import build_execution_plan
 from mantis.core.permissions import PermissionRequiredError
 from mantis.core.quality_gate import execute_with_quality_gate
 from mantis.tools.ast_extractor import build_edit_context
-from mantis.tools.builtins import run_tsc
 
 
 class QueryEngine:
@@ -89,7 +100,8 @@ class QueryEngine:
                     raise
 
             quality_result = await execute_with_quality_gate(
-                execute_fn, _prompt, task.task_type
+                execute_fn, _prompt, task.task_type,
+                file_targets=task.file_targets or None,
             )
             final_output = quality_result.output
             task_summary["quality_score"] = quality_result.score
@@ -110,22 +122,6 @@ class QueryEngine:
                     "ok": True,
                     "message": "Artifacts verified successfully.",
                 }
-            # TypeScript post-edit check: if any file target is .ts/.tsx,
-            # run tsc --noEmit and feed errors back as a retry prompt.
-            ts_files = [f for f in task.file_targets if f.endswith((".ts", ".tsx"))]
-            if ts_files:
-                ts_dir = str(Path(ts_files[0]).parent)
-                tsc_output = await run_tsc(path=ts_dir)
-                if tsc_output and tsc_output != "tsc: no errors found." and "error TS" in tsc_output:
-                    tsc_retry_prompt = (
-                        f"The TypeScript compiler found errors after your edit. Fix them:\n\n"
-                        f"{tsc_output}\n\nOriginal task: {_prompt}"
-                    )
-                    final_output = await execute_fn(tsc_retry_prompt, _timeout=150)
-                    task_summary["tsc_errors_fixed"] = True
-                else:
-                    task_summary["tsc_clean"] = True
-
             task_summary["status"] = "done"
             results.append(final_output)
             task_summaries.append(task_summary)
@@ -316,10 +312,7 @@ class QueryEngine:
                 name = function_call.get("name")
                 arguments_str = function_call.get("arguments")
 
-                try:
-                    arguments = json.loads(arguments_str)
-                except json.JSONDecodeError:
-                    raise Exception(f"Invalid JSON in function call arguments: {arguments_str}")
+                arguments = _parse_tool_arguments(arguments_str)
 
                 assistant_msg = {
                     "role": "assistant",
@@ -364,10 +357,7 @@ class QueryEngine:
                     name = function_info.get("name")
                     arguments_str = function_info.get("arguments")
 
-                    try:
-                        arguments = json.loads(arguments_str)
-                    except json.JSONDecodeError:
-                        raise Exception(f"Invalid JSON in tool call arguments: {arguments_str}")
+                    arguments = _parse_tool_arguments(arguments_str)
 
                     result = await self._execute_pending_call(
                         messages,
@@ -521,16 +511,23 @@ class QueryEngine:
                 return f"Generated checker failed for {check_file}: {(proc.stdout + proc.stderr).strip()[-400:]}"
 
         if test_files:
-            test_dir = str(test_files[0].parent)
-            proc = subprocess.run(
-                ["python", "-m", "pytest", "-q"],
-                cwd=test_dir,
-                capture_output=True,
-                text=True,
-                timeout=60,
+            test_dir = Path(test_files[0].parent)
+            # Only run pytest if this looks like a real project test directory
+            # (has conftest.py, pyproject.toml, or setup.cfg — not a /tmp one-off)
+            has_test_setup = any(
+                (test_dir / marker).exists()
+                for marker in ("conftest.py", "pyproject.toml", "setup.cfg", "setup.py")
             )
-            if proc.returncode != 0:
-                return f"Generated pytest suite failed in {test_dir}: {(proc.stdout + proc.stderr).strip()[-400:]}"
+            if has_test_setup:
+                proc = subprocess.run(
+                    ["python", "-m", "pytest", "-q", str(test_files[0])],
+                    cwd=str(test_dir),
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                if proc.returncode != 0:
+                    return f"Generated pytest suite failed in {test_dir}: {(proc.stdout + proc.stderr).strip()[-400:]}"
 
         return None
 

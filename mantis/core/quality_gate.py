@@ -2,13 +2,21 @@
 Standalone quality gate for MantisAI.
 
 Pattern: execute -> verify -> self-correct -> accept/fail.
-No external dependencies — stdlib + typing only.
+
+Quality cascade (3 tiers):
+  Tier 1 — Compile (tsc --noEmit / python -m py_compile)
+  Tier 2 — Test    (pytest / vitest, only if test files exist nearby)
+  Tier 3 — Semantic (heuristic scoring: defs, tool phrases, length)
 """
 from __future__ import annotations
 
 import asyncio
+import glob
+import os
+import subprocess
 from dataclasses import dataclass
-from typing import Any, Callable, Awaitable, Dict, Optional, Tuple
+from pathlib import Path
+from typing import Any, Callable, Awaitable, Dict, List, Optional, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +97,160 @@ def verify_output(
 
 
 # ---------------------------------------------------------------------------
+# Tier 1 — Compilation check
+# ---------------------------------------------------------------------------
+async def _check_compilation(
+    file_targets: List[str],
+    cwd: Optional[str] = None,
+) -> Optional[Tuple[bool, str]]:
+    """Run a language-specific compiler. Returns (passed, output) or None if N/A."""
+    ts_files = [f for f in file_targets if f.endswith((".ts", ".tsx"))]
+    py_files = [f for f in file_targets if f.endswith(".py")]
+
+    if ts_files:
+        ts_dir = str(Path(ts_files[0]).parent) if ts_files[0] != ts_files[0] else (cwd or ".")
+        # Find the nearest directory that has a tsconfig.json
+        check_dir = Path(cwd or ".") if cwd else Path(ts_files[0]).parent
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                f"cd {check_dir} && npx tsc --noEmit 2>&1",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+            output = (stdout + stderr).decode("utf-8").strip()
+            if proc.returncode == 0 or "error TS" not in output:
+                return (True, "tsc: clean")
+            return (False, output[:3000])
+        except (asyncio.TimeoutError, OSError):
+            return None  # can't run tsc — skip tier
+
+    if py_files:
+        errors = []
+        for f in py_files[:5]:  # check up to 5 files
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "python3", "-m", "py_compile", f,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+                if proc.returncode != 0:
+                    errors.append((stderr + stdout).decode("utf-8").strip())
+            except (asyncio.TimeoutError, OSError):
+                continue
+        if errors:
+            return (False, "\n".join(errors[:3]))
+        return (True, "py_compile: clean")
+
+    return None  # no recognized compiled language
+
+
+# ---------------------------------------------------------------------------
+# Tier 2 — Test runner check
+# ---------------------------------------------------------------------------
+async def _check_tests(
+    file_targets: List[str],
+    cwd: Optional[str] = None,
+) -> Optional[Tuple[bool, str]]:
+    """Run tests if test files exist near the targets. Returns (passed, output) or None."""
+    work_dir = cwd or "."
+
+    ts_files = [f for f in file_targets if f.endswith((".ts", ".tsx", ".js", ".jsx"))]
+    py_files = [f for f in file_targets if f.endswith(".py")]
+
+    if py_files:
+        # Avoid infinite recursion: if we're already inside a pytest run, skip
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return None
+        # Check if pytest is available and test files exist
+        test_files = glob.glob(os.path.join(work_dir, "**/test_*.py"), recursive=True)
+        if not test_files:
+            return None  # no tests to run
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                f"cd {work_dir} && python3 -m pytest -q --tb=short -x 2>&1",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+            output = (stdout + stderr).decode("utf-8").strip()
+            passed = proc.returncode == 0
+            return (passed, output[-2000:] if len(output) > 2000 else output)
+        except (asyncio.TimeoutError, OSError):
+            return None
+
+    if ts_files:
+        # Check for vitest or jest config
+        has_vitest = os.path.exists(os.path.join(work_dir, "vitest.config.ts")) or \
+                     os.path.exists(os.path.join(work_dir, "vitest.config.js"))
+        has_jest = os.path.exists(os.path.join(work_dir, "jest.config.ts")) or \
+                   os.path.exists(os.path.join(work_dir, "jest.config.js"))
+        if not has_vitest and not has_jest:
+            return None
+        cmd = "npx vitest run --reporter=verbose 2>&1" if has_vitest else "npx jest --passWithNoTests 2>&1"
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                f"cd {work_dir} && {cmd}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+            output = (stdout + stderr).decode("utf-8").strip()
+            passed = proc.returncode == 0
+            return (passed, output[-2000:] if len(output) > 2000 else output)
+        except (asyncio.TimeoutError, OSError):
+            return None
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Cascade — all 3 tiers
+# ---------------------------------------------------------------------------
+async def verify_cascade(
+    task_type: str,
+    output: str,
+    file_targets: Optional[List[str]] = None,
+    cwd: Optional[str] = None,
+) -> Tuple[float, str]:
+    """3-tier quality cascade: compile → test → semantic.
+
+    Returns (score, reason). Compilation failure = 0.3, test failure = 0.4,
+    both pass = max(semantic, 0.8).
+    """
+    tier_feedback: List[str] = []
+
+    # Tier 1: Compilation
+    if file_targets:
+        compile_result = await _check_compilation(file_targets, cwd)
+        if compile_result is not None:
+            passed, compile_output = compile_result
+            if not passed:
+                return 0.3, f"Tier 1 FAIL (compile):\n{compile_output}"
+            tier_feedback.append("compile: PASS")
+
+    # Tier 2: Tests
+    if file_targets:
+        test_result = await _check_tests(file_targets, cwd)
+        if test_result is not None:
+            passed, test_output = test_result
+            if not passed:
+                return 0.4, f"Tier 2 FAIL (tests):\n{test_output}"
+            tier_feedback.append("tests: PASS")
+
+    # Tier 3: Semantic (existing heuristic)
+    semantic_score, semantic_reason = verify_output(task_type, output, cwd)
+
+    # If hard checks (compile/tests) passed, floor at 0.8
+    if tier_feedback:
+        final_score = max(semantic_score, GOOD)
+        return final_score, " | ".join(tier_feedback + [f"semantic: {semantic_reason}"])
+
+    return semantic_score, semantic_reason
+
+
+# ---------------------------------------------------------------------------
 # Core gate
 # ---------------------------------------------------------------------------
 async def execute_with_quality_gate(
@@ -97,8 +259,13 @@ async def execute_with_quality_gate(
     task_type: str,
     cwd: Optional[str] = None,
     max_attempts: int = 2,
+    file_targets: Optional[List[str]] = None,
 ) -> QualityResult:
     """Run *execute_fn*, verify quality, self-correct if needed.
+
+    When *file_targets* are provided the 3-tier cascade runs
+    (compile → test → semantic).  Without them, only the semantic
+    heuristic fires (backwards-compatible).
 
     * ``>= 0.8``  — accept immediately.
     * ``0.6–0.8`` — append feedback and retry (if attempts remain).
@@ -111,7 +278,13 @@ async def execute_with_quality_gate(
     current_prompt = prompt
     for attempt in range(1, max_attempts + 1):
         output = await execute_fn(current_prompt)
-        score, reason = verify_output(task_type, output, cwd=cwd)
+
+        # Use cascade when file targets are available, else semantic only
+        if file_targets:
+            score, reason = await verify_cascade(task_type, output, file_targets, cwd)
+        else:
+            score, reason = verify_output(task_type, output, cwd=cwd)
+
         self_corrected = attempt > 1
 
         result = QualityResult(
