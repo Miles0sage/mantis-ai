@@ -19,6 +19,7 @@ class ModelAdapter:
         self.cost_per_1k_input = cost_per_1k_input
         self.cost_per_1k_output = cost_per_1k_output
         self.max_budget_usd = max_budget_usd
+        self.requires_temp_1: bool = False  # set by swap_to_profile for MiniMax/DeepSeek-R1
         self._total_input_tokens = 0
         self._total_output_tokens = 0
         self._total_cost_usd = 0.0
@@ -38,6 +39,7 @@ class ModelAdapter:
             "model": self.model,
             "cost_per_1k_input": self.cost_per_1k_input,
             "cost_per_1k_output": self.cost_per_1k_output,
+            "requires_temp_1": self.requires_temp_1,
         }
 
     def restore_snapshot(self, snapshot: dict) -> None:
@@ -55,6 +57,7 @@ class ModelAdapter:
         self.model = snapshot["model"]
         self.cost_per_1k_input = snapshot["cost_per_1k_input"]
         self.cost_per_1k_output = snapshot["cost_per_1k_output"]
+        self.requires_temp_1 = snapshot.get("requires_temp_1", False)
 
     def swap_to_profile(self, profile) -> None:
         """Swap to a different ModelProfile, replacing httpx client if api_key changes."""
@@ -71,6 +74,7 @@ class ModelAdapter:
         self.model = profile.name
         self.cost_per_1k_input = profile.cost_per_1k_input
         self.cost_per_1k_output = profile.cost_per_1k_output
+        self.requires_temp_1 = getattr(profile, "requires_temp_1", False)
 
     @property
     def total_input_tokens(self) -> int:
@@ -156,6 +160,10 @@ class ModelAdapter:
     async def chat(self, messages: List[Dict], tools: List[Dict] = None, temperature: float = 0.7) -> Dict:
         self._check_budget()
         url = f"{self.base_url}/chat/completions"
+
+        # Some models (MiniMax, DeepSeek-R1) require temperature=1.0 exactly.
+        if self.requires_temp_1:
+            temperature = 1.0
 
         payload = {
             "model": self.model,

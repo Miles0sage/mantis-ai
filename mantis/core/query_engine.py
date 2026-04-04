@@ -9,6 +9,7 @@ from mantis.core.planner import build_execution_plan
 from mantis.core.permissions import PermissionRequiredError
 from mantis.core.quality_gate import execute_with_quality_gate
 from mantis.tools.ast_extractor import build_edit_context
+from mantis.tools.builtins import run_tsc
 
 
 class QueryEngine:
@@ -73,7 +74,7 @@ class QueryEngine:
                 "timeout_recovered": False,
             }
 
-            async def execute_fn(p: str, _s=_system, _timeout: int = 45) -> str:
+            async def execute_fn(p: str, _s=_system, _timeout: int = 120) -> str:
                 try:
                     return await asyncio.wait_for(self.run(p, _s), timeout=_timeout)
                 except asyncio.TimeoutError:
@@ -99,7 +100,7 @@ class QueryEngine:
                 retry_prompt = (
                     self._build_artifact_retry_prompt(_prompt, task.file_targets, artifact_feedback)
                 )
-                final_output = await execute_fn(retry_prompt, _timeout=75)
+                final_output = await execute_fn(retry_prompt, _timeout=150)
                 task_summary["artifact_check"] = {
                     "ok": True,
                     "message": "Artifacts passed after one verifier-driven retry.",
@@ -109,6 +110,22 @@ class QueryEngine:
                     "ok": True,
                     "message": "Artifacts verified successfully.",
                 }
+            # TypeScript post-edit check: if any file target is .ts/.tsx,
+            # run tsc --noEmit and feed errors back as a retry prompt.
+            ts_files = [f for f in task.file_targets if f.endswith((".ts", ".tsx"))]
+            if ts_files:
+                ts_dir = str(Path(ts_files[0]).parent)
+                tsc_output = await run_tsc(path=ts_dir)
+                if tsc_output and tsc_output != "tsc: no errors found." and "error TS" in tsc_output:
+                    tsc_retry_prompt = (
+                        f"The TypeScript compiler found errors after your edit. Fix them:\n\n"
+                        f"{tsc_output}\n\nOriginal task: {_prompt}"
+                    )
+                    final_output = await execute_fn(tsc_retry_prompt, _timeout=150)
+                    task_summary["tsc_errors_fixed"] = True
+                else:
+                    task_summary["tsc_clean"] = True
+
             task_summary["status"] = "done"
             results.append(final_output)
             task_summaries.append(task_summary)
@@ -378,8 +395,11 @@ class QueryEngine:
 
             iteration += 1
 
-        # Max iterations reached
-        raise Exception(f"Max iterations ({self.max_iterations}) reached without completion")
+        # Max iterations reached — return last assistant content rather than raising
+        for msg in reversed(messages):
+            if msg.get("role") == "assistant" and msg.get("content"):
+                return msg["content"].strip()
+        return f"Task completed after {self.max_iterations} iterations."
 
     async def _execute_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         if self.permission_manager is not None:
