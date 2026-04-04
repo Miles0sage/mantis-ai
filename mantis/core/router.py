@@ -13,6 +13,8 @@ class ModelProfile:
     context_window: int
     supports_tools: bool
     supports_streaming: bool
+    requires_temp_1: bool = False   # MiniMax / DeepSeek-R1 need temperature=1.0
+    supports_thinking: bool = False  # Claude 3.7+ extended thinking
 
 
 class ModelRouter:

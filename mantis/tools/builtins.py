@@ -157,6 +157,40 @@ async def run_bash(command: str, timeout: int = 120) -> str:
         return f"Error running command '{command}': {str(e)}"
 
 
+async def run_tsc(path: str = ".", args: str = "--noEmit") -> str:
+    """
+    Run the TypeScript compiler and return diagnostics.
+
+    Args:
+        path: Directory containing tsconfig.json (default: current directory)
+        args: Extra tsc arguments (default: --noEmit)
+
+    Returns:
+        Compiler output or a success message if no errors.
+    """
+    command = f"cd {path} && npx tsc {args} 2>&1"
+    try:
+        process = await asyncio.create_subprocess_shell(
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60)
+            output = (stdout + stderr).decode("utf-8").strip()
+            if not output and process.returncode == 0:
+                return "tsc: no errors found."
+            if len(output) > 8000:
+                output = output[:8000] + "... [output truncated]"
+            return output
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            return f"tsc timed out after 60 seconds in '{path}'."
+    except Exception as e:
+        return f"Error running tsc in '{path}': {str(e)}"
+
+
 async def glob_files(pattern: str, path: str = ".") -> str:
     """
     Find files matching a glob pattern.
@@ -384,5 +418,15 @@ def register_builtins(registry: ToolRegistry) -> None:
     registry.register("run_bash", "Run a shell command and return stdout+stderr", run_bash_schema, run_bash)
     registry.register("glob_files", "Find files matching a glob pattern", glob_files_schema, glob_files)
     registry.register("grep_search", "Search file contents with a regex pattern", grep_search_schema, grep_search)
+    run_tsc_schema = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Directory containing tsconfig.json", "default": "."},
+            "args": {"type": "string", "description": "Extra tsc arguments", "default": "--noEmit"},
+        },
+        "required": [],
+    }
+
     registry.register("memory_save", "Save content to persistent memory under a key", memory_save_schema, memory_save)
     registry.register("memory_recall", "Search persistent memory and return matching snippets", memory_recall_schema, memory_recall)
+    registry.register("run_tsc", "Run TypeScript compiler and return diagnostics", run_tsc_schema, run_tsc)

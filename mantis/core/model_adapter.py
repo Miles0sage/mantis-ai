@@ -107,19 +107,41 @@ class ModelAdapter:
             output_tokens * self.cost_per_1k_output / 1000
         )
 
+    @staticmethod
+    def _coerce_text(content) -> str:
+        """Normalize LLM content field: str pass-through, list-of-chunks concatenated."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for chunk in content:
+                if isinstance(chunk, str):
+                    parts.append(chunk)
+                elif isinstance(chunk, dict):
+                    parts.append(chunk.get("text", ""))
+            return "".join(parts)
+        return ""
+
     async def _make_request(self, url: str, payload: dict) -> httpx.Response:
         for attempt in range(1, 4):  # max 3 retries
             try:
                 response = await self.client.post(url, json=payload)
-                
+
                 if response.status_code == 200:
                     return response
                 elif response.status_code in [429, 500, 502, 503]:
-                    if attempt == 3:  # last attempt
+                    if attempt == 3:
                         raise Exception(f"Request failed after 3 attempts. Status: {response.status_code}")
-                    
-                    # Exponential backoff: wait 2^attempt seconds
-                    wait_time = 2 ** attempt
+
+                    # Respect Retry-After header when present (429 rate limit)
+                    retry_after = response.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            wait_time = float(retry_after)
+                        except ValueError:
+                            wait_time = 2 ** attempt
+                    else:
+                        wait_time = 2 ** attempt
                     await asyncio.sleep(wait_time)
                 else:
                     response.raise_for_status()
@@ -128,28 +150,57 @@ class ModelAdapter:
                     raise e
                 wait_time = 2 ** attempt
                 await asyncio.sleep(wait_time)
-        
+
         raise Exception("Unexpected flow - should not reach here")
 
     async def chat(self, messages: List[Dict], tools: List[Dict] = None, temperature: float = 0.7) -> Dict:
         self._check_budget()
         url = f"{self.base_url}/chat/completions"
-        
+
         payload = {
             "model": self.model,
             "messages": messages,
             "temperature": temperature,
-            "max_tokens": self.max_tokens
+            "max_tokens": self.max_tokens,
         }
-        
+
         if tools:
             payload["tools"] = tools
-        
+
         response = await self._make_request(url, payload)
         result = response.json()
-        
+
         usage = result.get("usage", {})
         self._register_usage(usage)
+
+        # Auto-continuation: if the model stopped due to token limit, keep going
+        accumulated_text = ""
+        choice = result.get("choices", [{}])[0]
+        finish_reason = choice.get("finish_reason", "")
+        if choice.get("message", {}).get("content"):
+            accumulated_text = self._coerce_text(choice["message"]["content"])
+
+        while finish_reason == "length":
+            self._check_budget()
+            continuation_messages = list(messages) + [
+                {"role": "assistant", "content": accumulated_text},
+                {"role": "user", "content": "Continue."},
+            ]
+            cont_payload = dict(payload)
+            cont_payload["messages"] = continuation_messages
+            cont_response = await self._make_request(url, cont_payload)
+            cont_result = cont_response.json()
+            self._register_usage(cont_result.get("usage", {}))
+            cont_choice = cont_result.get("choices", [{}])[0]
+            chunk = self._coerce_text(cont_choice.get("message", {}).get("content", ""))
+            accumulated_text += chunk
+            finish_reason = cont_choice.get("finish_reason", "stop")
+
+        if accumulated_text:
+            result.setdefault("choices", [{}])
+            if result["choices"]:
+                result["choices"][0].setdefault("message", {})
+                result["choices"][0]["message"]["content"] = accumulated_text
 
         return result
 
