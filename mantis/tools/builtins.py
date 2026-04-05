@@ -11,10 +11,91 @@ import fnmatch
 from mantis.core.tool_registry import ToolRegistry
 from mantis.memory.store import MemoryStore
 from mantis.memory.search import MemorySearch
+from mantis.tools.ast_extractor import (
+    build_edit_context as _build_edit_context,
+    extract_symbol as _extract_symbol,
+    extract_symbols as _extract_symbols,
+    replace_symbol as _replace_symbol,
+)
 from mantis.tools.edit_applicator import apply_edit as _apply_edit
 
 _memory_store = MemoryStore()
 _memory_search = MemorySearch(_memory_store)
+
+
+_JS_SYMBOL_PATTERNS = [
+    re.compile(r"^\s*export\s+class\s+(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)", re.MULTILINE),
+    re.compile(r"^\s*class\s+(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)", re.MULTILINE),
+    re.compile(r"^\s*export\s+function\s+(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)\s*\(", re.MULTILINE),
+    re.compile(r"^\s*function\s+(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)\s*\(", re.MULTILINE),
+    re.compile(r"^\s*export\s+const\s+(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?:async\s*)?\(", re.MULTILINE),
+    re.compile(r"^\s*const\s+(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?:async\s*)?\(", re.MULTILINE),
+    re.compile(r"^\s*export\s+const\s+(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?:async\s*)?[A-Za-z_$][^=]*=>", re.MULTILINE),
+    re.compile(r"^\s*const\s+(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?:async\s*)?[A-Za-z_$][^=]*=>", re.MULTILINE),
+]
+
+
+def _list_js_symbols(file_path: str) -> list[dict[str, Any]]:
+    try:
+        source = Path(file_path).read_text(encoding="utf-8")
+    except OSError:
+        return []
+
+    symbols: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    lines = source.splitlines()
+
+    for pattern in _JS_SYMBOL_PATTERNS:
+        for match in pattern.finditer(source):
+            name = match.group("name")
+            if name in seen:
+                continue
+            seen.add(name)
+            line_no = source.count("\n", 0, match.start()) + 1
+            kind = "class" if "class" in match.group(0) else "function"
+            preview = lines[line_no - 1].strip() if 0 <= line_no - 1 < len(lines) else ""
+            symbols.append({"name": name, "kind": kind, "line": line_no, "preview": preview})
+
+    return sorted(symbols, key=lambda item: item["line"])
+
+
+def _read_js_symbol(file_path: str, symbol_name: str) -> str | None:
+    try:
+        source = Path(file_path).read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    lines = source.splitlines()
+    symbols = _list_js_symbols(file_path)
+    start_line = None
+    end_line = len(lines)
+    for index, symbol in enumerate(symbols):
+        if symbol["name"] != symbol_name:
+            continue
+        start_line = symbol["line"] - 1
+        if index + 1 < len(symbols):
+            end_line = symbols[index + 1]["line"] - 1
+        break
+
+    if start_line is None:
+        return None
+
+    return "\n".join(lines[start_line:end_line]).strip()
+
+
+def _build_js_edit_context(file_path: str, task_description: str) -> str:
+    symbols = _list_js_symbols(file_path)
+    if not symbols:
+        return f"Error: No JS/TS symbols found in '{file_path}'."
+    lines = [
+        f"JS/TS edit context for {file_path}",
+        f"Task: {task_description}",
+        "",
+        "Top-level symbols:",
+    ]
+    for symbol in symbols[:20]:
+        lines.append(f"- {symbol['kind']} {symbol['name']} (line {symbol['line']}): {symbol['preview']}")
+    return "\n".join(lines)
 
 
 async def read_file(file_path: str, offset: int = 0, limit: int = 2000) -> str:
@@ -320,6 +401,56 @@ async def memory_recall(query: str) -> str:
         return f"Error recalling memories for '{query}': {str(e)}"
 
 
+async def list_python_symbols(file_path: str) -> list[dict[str, Any]]:
+    """List top-level Python symbols for semantic navigation."""
+    return _extract_symbols(file_path)
+
+
+async def read_python_symbol(file_path: str, symbol_name: str) -> str:
+    """Read a specific Python symbol by name."""
+    source = _extract_symbol(file_path, symbol_name)
+    if source is None:
+        return f"Symbol '{symbol_name}' not found in '{file_path}'."
+    return source
+
+
+async def replace_python_symbol(file_path: str, symbol_name: str, new_source: str) -> dict[str, Any]:
+    """Replace one Python symbol while preserving the rest of the file."""
+    success = _replace_symbol(file_path, symbol_name, new_source)
+    if success:
+        return {
+            "success": True,
+            "message": f"Replaced symbol '{symbol_name}' in '{file_path}'.",
+        }
+    return {
+        "success": False,
+        "message": f"Could not replace symbol '{symbol_name}' in '{file_path}'.",
+    }
+
+
+async def build_python_edit_context(file_path: str, task_description: str) -> str:
+    """Build focused semantic context for a Python edit task."""
+    return _build_edit_context(file_path, task_description)
+
+
+async def list_js_symbols(file_path: str) -> list[dict[str, Any]]:
+    """List top-level JS/TS symbols for semantic navigation."""
+    return _list_js_symbols(file_path)
+
+
+async def read_js_symbol(file_path: str, symbol_name: str) -> str:
+    """Read a specific JS/TS symbol by name."""
+    source = _read_js_symbol(file_path, symbol_name)
+    if source is None:
+        return f"Symbol '{symbol_name}' not found in '{file_path}'."
+    return source
+
+
+async def build_js_edit_context(file_path: str, task_description: str) -> str:
+    """Build focused semantic context for a JS/TS edit task."""
+    return _build_js_edit_context(file_path, task_description)
+
+
 def register_builtins(registry: ToolRegistry) -> None:
     """
     Register all builtin tools with the provided registry.
@@ -411,10 +542,79 @@ def register_builtins(registry: ToolRegistry) -> None:
         "required": ["file_path", "search_text", "replace_text"]
     }
 
+    list_python_symbols_schema = {
+        "type": "object",
+        "properties": {
+            "file_path": {"type": "string", "description": "Path to the Python file to inspect"}
+        },
+        "required": ["file_path"]
+    }
+
+    read_python_symbol_schema = {
+        "type": "object",
+        "properties": {
+            "file_path": {"type": "string", "description": "Path to the Python file to inspect"},
+            "symbol_name": {"type": "string", "description": "Top-level function or class name to read"}
+        },
+        "required": ["file_path", "symbol_name"]
+    }
+
+    replace_python_symbol_schema = {
+        "type": "object",
+        "properties": {
+            "file_path": {"type": "string", "description": "Path to the Python file to edit"},
+            "symbol_name": {"type": "string", "description": "Top-level function or class name to replace"},
+            "new_source": {"type": "string", "description": "Replacement source for the symbol"}
+        },
+        "required": ["file_path", "symbol_name", "new_source"]
+    }
+
+    build_python_edit_context_schema = {
+        "type": "object",
+        "properties": {
+            "file_path": {"type": "string", "description": "Path to the Python file to inspect"},
+            "task_description": {"type": "string", "description": "Short description of the edit task"}
+        },
+        "required": ["file_path", "task_description"]
+    }
+
+    list_js_symbols_schema = {
+        "type": "object",
+        "properties": {
+            "file_path": {"type": "string", "description": "Path to the JS/TS file to inspect"}
+        },
+        "required": ["file_path"]
+    }
+
+    read_js_symbol_schema = {
+        "type": "object",
+        "properties": {
+            "file_path": {"type": "string", "description": "Path to the JS/TS file to inspect"},
+            "symbol_name": {"type": "string", "description": "Top-level class or function name to read"}
+        },
+        "required": ["file_path", "symbol_name"]
+    }
+
+    build_js_edit_context_schema = {
+        "type": "object",
+        "properties": {
+            "file_path": {"type": "string", "description": "Path to the JS/TS file to inspect"},
+            "task_description": {"type": "string", "description": "Short description of the edit task"}
+        },
+        "required": ["file_path", "task_description"]
+    }
+
     registry.register("read_file", "Read a file and return its contents with line numbers", read_file_schema, read_file)
     registry.register("write_file", "Write content to a file, creating directories if needed", write_file_schema, write_file)
     registry.register("edit_file", "Replace a string in a file with a new string", edit_file_schema, edit_file)
     registry.register("apply_edit", "Apply a SEARCH/REPLACE edit using fuzzy matching (exact, whitespace-flexible, or difflib fuzzy)", apply_edit_schema, apply_edit)
+    registry.register("list_python_symbols", "List top-level Python functions and classes for semantic navigation", list_python_symbols_schema, list_python_symbols)
+    registry.register("read_python_symbol", "Read a specific top-level Python function or class by name", read_python_symbol_schema, read_python_symbol)
+    registry.register("replace_python_symbol", "Replace a top-level Python function or class while preserving the rest of the file", replace_python_symbol_schema, replace_python_symbol)
+    registry.register("build_python_edit_context", "Build focused semantic context for a Python edit task", build_python_edit_context_schema, build_python_edit_context)
+    registry.register("list_js_symbols", "List top-level JS/TS classes and functions for semantic navigation", list_js_symbols_schema, list_js_symbols)
+    registry.register("read_js_symbol", "Read a specific top-level JS/TS class or function by name", read_js_symbol_schema, read_js_symbol)
+    registry.register("build_js_edit_context", "Build focused semantic context for a JS/TS edit task", build_js_edit_context_schema, build_js_edit_context)
     registry.register("run_bash", "Run a shell command and return stdout+stderr", run_bash_schema, run_bash)
     registry.register("glob_files", "Find files matching a glob pattern", glob_files_schema, glob_files)
     registry.register("grep_search", "Search file contents with a regex pattern", grep_search_schema, grep_search)

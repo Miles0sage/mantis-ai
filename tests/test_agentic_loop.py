@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from mantis.core.approval_store import ApprovalStore
+from mantis.core.context_manager import ContextManager
 from mantis.core.permissions import PermissionManager, PermissionRequiredError
 from mantis.core.tool_registry import ToolRegistry
 from mantis.core.query_engine import QueryEngine
@@ -251,9 +252,12 @@ async def test_run_agentic_retries_when_generated_checker_fails(tmp_path):
     engine = _make_engine()
     engine.run = fake_run
 
-    with patch("mantis.core.query_engine.build_execution_plan") as mock_plan, patch(
-        "mantis.core.quality_gate.verify_output", return_value=(0.9, "good")
-    ):
+    async def _fake_cascade(*a, **kw):
+        return (0.9, "good")
+
+    with patch("mantis.core.query_engine.build_execution_plan") as mock_plan, \
+         patch("mantis.core.quality_gate.verify_output", return_value=(0.9, "good")), \
+         patch("mantis.core.quality_gate.verify_cascade", new=_fake_cascade):
         from mantis.core.planner import ExecutionPlan, PlannedTask
 
         mock_plan.return_value = ExecutionPlan(
@@ -276,6 +280,311 @@ async def test_run_agentic_retries_when_generated_checker_fails(tmp_path):
     assert "[ARTIFACT VERIFICATION FEEDBACK]" in prompts[-1]
     assert f"[FILE: {check}]" in prompts[-1]
     assert "Satisfy the generated checks exactly" in prompts[-1]
+
+
+@pytest.mark.asyncio
+async def test_run_agentic_adds_semantic_guidance_for_python_tasks(tmp_path):
+    target = tmp_path / "sample.py"
+    target.write_text(
+        "def planner_fix():\n    return 'before'\n",
+        encoding="utf-8",
+    )
+    captured_prompts: list[str] = []
+
+    async def fake_run(prompt, system_prompt=None):
+        captured_prompts.append(prompt)
+        return "updated"
+
+    engine = _make_engine()
+    engine.run = fake_run
+
+    async def _fake_cascade(*a, **kw):
+        return (0.9, "good")
+
+    with patch("mantis.core.query_engine.build_execution_plan") as mock_plan, \
+         patch("mantis.core.quality_gate.verify_output", return_value=(0.9, "good")), \
+         patch("mantis.core.quality_gate.verify_cascade", new=_fake_cascade):
+        from mantis.core.planner import ExecutionPlan, PlannedTask
+
+        mock_plan.return_value = ExecutionPlan(
+            task_type="bug_fix",
+            complexity="low",
+            can_run_in_parallel=False,
+            needs_escalation=False,
+            tasks=[
+                PlannedTask(
+                    title="fix sample",
+                    prompt=f"fix {target}",
+                    task_type="bug_fix",
+                    file_targets=[str(target)],
+                )
+            ],
+        )
+
+        await engine.run_agentic(f"fix {target}")
+
+    assert len(captured_prompts) == 1
+    enriched = captured_prompts[0]
+    assert "[PYTHON EDIT STRATEGY]" in enriched
+    assert "list_python_symbols" in enriched
+    assert "replace_python_symbol" in enriched
+
+
+@pytest.mark.asyncio
+async def test_run_agentic_adds_semantic_guidance_for_js_tasks(tmp_path):
+    engine = _make_engine("result")
+    target = tmp_path / "auth.ts"
+    target.write_text("export class AuthService {}\n", encoding="utf-8")
+
+    with patch("mantis.core.query_engine.build_execution_plan") as mock_plan:
+        mock_plan.return_value.tasks = [
+            MagicMock(
+                prompt="add createSession to auth flow",
+                file_targets=[str(target)],
+                task_type="feature",
+                needs_escalation=False,
+                postconditions=[],
+            )
+        ]
+        mock_plan.return_value.complexity = "medium"
+        with patch("mantis.core.quality_gate.verify_output", return_value=(0.9, "good")):
+            await engine.run_agentic("add createSession to auth flow")
+
+    enriched = engine.run.call_args.args[0]
+    assert "[JS/TS EDIT STRATEGY]" in enriched
+    assert "list_js_symbols" in enriched
+    assert "read_js_symbol" in enriched
+
+
+@pytest.mark.asyncio
+async def test_run_streaming_adds_semantic_guidance_for_python_tasks(tmp_path):
+    target = tmp_path / "sample.py"
+    target.write_text(
+        "def planner_fix():\n    return 'before'\n",
+        encoding="utf-8",
+    )
+
+    model_adapter = MagicMock()
+    model_adapter.total_cost_usd = 0.0
+    model_adapter.remaining_budget_usd = None
+    tool_registry = MagicMock()
+    engine = QueryEngine(
+        model_adapter=model_adapter,
+        tool_registry=tool_registry,
+        max_iterations=5,
+    )
+    engine.run_agentic = AsyncMock(return_value="done")
+
+    with patch("mantis.core.query_engine.build_execution_plan") as mock_plan:
+        from mantis.core.planner import ExecutionPlan, PlannedTask
+
+        mock_plan.return_value = ExecutionPlan(
+            task_type="bug_fix",
+            complexity="low",
+            can_run_in_parallel=False,
+            needs_escalation=False,
+            tasks=[
+                PlannedTask(
+                    title="fix sample",
+                    prompt=f"fix {target}",
+                    task_type="bug_fix",
+                    file_targets=[str(target)],
+                )
+            ],
+        )
+
+        chunks = []
+        async for chunk in engine.run_streaming(f"fix {target}"):
+            chunks.append(chunk)
+
+    assert chunks
+    engine.run_agentic.assert_awaited_once()
+    user_message = engine.run_agentic.await_args.args[0]
+    assert "[PYTHON EDIT STRATEGY]" in user_message
+    assert "replace_python_symbol" in user_message
+
+
+@pytest.mark.asyncio
+async def test_run_streaming_uses_agent_run_not_raw_model_stream():
+    model_adapter = MagicMock()
+    model_adapter.stream = AsyncMock()
+    model_adapter.total_cost_usd = 0.0
+    model_adapter.remaining_budget_usd = None
+    tool_registry = MagicMock()
+    engine = QueryEngine(
+        model_adapter=model_adapter,
+        tool_registry=tool_registry,
+        max_iterations=5,
+    )
+    engine.run_agentic = AsyncMock(return_value="final answer")
+
+    with patch("mantis.core.query_engine.build_execution_plan") as mock_plan:
+        from mantis.core.planner import ExecutionPlan, PlannedTask
+
+        mock_plan.return_value = ExecutionPlan(
+            task_type="unknown",
+            complexity="low",
+            can_run_in_parallel=False,
+            needs_escalation=False,
+            tasks=[
+                PlannedTask(
+                    title="answer",
+                    prompt="answer cleanly",
+                    task_type="unknown",
+                    file_targets=[],
+                )
+            ],
+        )
+
+        chunks = []
+        async for chunk in engine.run_streaming("answer cleanly"):
+            chunks.append(chunk)
+
+    assert chunks
+    engine.run_agentic.assert_awaited_once()
+    model_adapter.stream.assert_not_called()
+    assert any('"content": "final "' in chunk for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_run_streaming_emits_tool_progress_events():
+    model_adapter = MagicMock()
+    model_adapter.stream = AsyncMock()
+    model_adapter.total_cost_usd = 0.0
+    model_adapter.remaining_budget_usd = None
+    tool_registry = MagicMock()
+    engine = QueryEngine(
+        model_adapter=model_adapter,
+        tool_registry=tool_registry,
+        max_iterations=5,
+    )
+
+    async def fake_run_agentic(prompt, system_prompt=None, event_callback=None):
+        await event_callback({"type": "tool_call", "tool_name": "read_file"})
+        await asyncio.sleep(0)
+        await event_callback({"type": "tool_result", "tool_name": "read_file"})
+        return "final answer"
+
+    engine.run_agentic = AsyncMock(side_effect=fake_run_agentic)
+
+    with patch("mantis.core.query_engine.build_execution_plan") as mock_plan:
+        from mantis.core.planner import ExecutionPlan, PlannedTask
+
+        mock_plan.return_value = ExecutionPlan(
+            task_type="unknown",
+            complexity="low",
+            can_run_in_parallel=False,
+            needs_escalation=False,
+            tasks=[
+                PlannedTask(
+                    title="answer",
+                    prompt="answer cleanly",
+                    task_type="unknown",
+                    file_targets=[],
+                )
+            ],
+        )
+
+        chunks = []
+        async for chunk in engine.run_streaming("answer cleanly"):
+            chunks.append(chunk)
+
+    assert any("Using tool: read_file" in chunk for chunk in chunks)
+    assert any("Completed tool: read_file" in chunk for chunk in chunks)
+    assert any('"content": "final "' in chunk for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_run_suppresses_repeated_identical_tool_calls():
+    model_adapter = MagicMock()
+    model_adapter.chat = AsyncMock(
+        side_effect=[
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "read_file",
+                                        "arguments": '{"file_path": "demo.py"}',
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ],
+                "usage": {},
+            },
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "call-2",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "read_file",
+                                        "arguments": '{"file_path": "demo.py"}',
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ],
+                "usage": {},
+            },
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "call-3",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "read_file",
+                                        "arguments": '{"file_path": "demo.py"}',
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ],
+                "usage": {},
+            },
+            {
+                "choices": [{"message": {"content": "4"}}],
+                "usage": {},
+            },
+        ]
+    )
+    tool_registry = ToolRegistry()
+    executed: list[str] = []
+
+    async def read_file(file_path: str) -> str:
+        executed.append(file_path)
+        return "def test_a(): pass\ndef test_b(): pass"
+
+    tool_registry.register(
+        "read_file",
+        "Read file",
+        {
+            "type": "object",
+            "properties": {"file_path": {"type": "string"}},
+            "required": ["file_path"],
+        },
+        read_file,
+    )
+
+    engine = QueryEngine(model_adapter=model_adapter, tool_registry=tool_registry, max_iterations=6)
+    result = await engine.run("count tests")
+
+    assert result == "4"
+    assert executed == ["demo.py", "demo.py"]
 
 
 @pytest.mark.asyncio
@@ -318,3 +627,153 @@ async def test_run_agentic_returns_when_run_times_out_but_artifacts_pass(tmp_pat
         result = await engine.run_agentic("Create binary search and tests")
 
     assert "artifact checks passed" in result
+
+
+@pytest.mark.asyncio
+async def test_run_agentic_records_postcondition_success(tmp_path):
+    target = tmp_path / "token_bucket.py"
+    helper = tmp_path / "helpers.py"
+
+    async def fake_run(prompt, system_prompt=None):
+        target.write_text(
+            "class TokenBucket:\n"
+            "    def __init__(self):\n"
+            "        self.tokens = 1\n",
+            encoding="utf-8",
+        )
+        helper.write_text(
+            "def allow(tokens: int = 1):\n"
+            "    return True\n\n"
+            "def available():\n"
+            "    return 1\n",
+            encoding="utf-8",
+        )
+        return "written and saved successfully"
+
+    engine = _make_engine()
+    engine.run = fake_run
+
+    async def _fake_cascade(*a, **kw):
+        return (0.9, "good")
+
+    with patch("mantis.core.query_engine.build_execution_plan") as mock_plan, \
+         patch("mantis.core.quality_gate.verify_output", return_value=(0.9, "good")), \
+         patch("mantis.core.quality_gate.verify_cascade", new=_fake_cascade):
+        from mantis.core.planner import ExecutionPlan, PlannedTask
+
+        mock_plan.return_value = ExecutionPlan(
+            task_type="feature",
+            complexity="medium",
+            can_run_in_parallel=False,
+            needs_escalation=False,
+            tasks=[
+                PlannedTask(
+                    title="token bucket",
+                    prompt=f"Create {target} and {helper}",
+                    task_type="feature",
+                    file_targets=[str(target), str(helper)],
+                    postconditions=[
+                        f"file exists: {target}",
+                        "class exists: TokenBucket",
+                        "method exists: allow",
+                        "method exists: available",
+                    ],
+                )
+            ],
+        )
+        await engine.run_agentic("Create token bucket")
+
+    task = engine.last_run_details["tasks"][0]
+    assert task["postcondition_check"]["ok"] is True
+    assert engine.last_run_details["verifier"]["verdict"] == "pass"
+
+
+@pytest.mark.asyncio
+async def test_run_agentic_fails_when_postconditions_still_missing_after_retry(tmp_path):
+    target = tmp_path / "token_bucket.py"
+
+    prompts: list[str] = []
+
+    async def fake_run(prompt, system_prompt=None):
+        prompts.append(prompt)
+        target.write_text(
+            "class WrongName:\n"
+            "    def available(self):\n"
+            "        return 1\n",
+            encoding="utf-8",
+        )
+        return "written and saved successfully"
+
+    engine = _make_engine()
+    engine.run = fake_run
+
+    async def _fake_cascade(*a, **kw):
+        return (0.9, "good")
+
+    with patch("mantis.core.query_engine.build_execution_plan") as mock_plan, \
+         patch("mantis.core.quality_gate.verify_output", return_value=(0.9, "good")), \
+         patch("mantis.core.quality_gate.verify_cascade", new=_fake_cascade):
+        from mantis.core.planner import ExecutionPlan, PlannedTask
+
+        mock_plan.return_value = ExecutionPlan(
+            task_type="feature",
+            complexity="low",
+            can_run_in_parallel=False,
+            needs_escalation=False,
+            tasks=[
+                PlannedTask(
+                    title="token bucket",
+                    prompt=f"Create {target}",
+                    task_type="feature",
+                    file_targets=[str(target)],
+                    postconditions=[
+                        f"file exists: {target}",
+                        "class exists: TokenBucket",
+                        "method exists: allow",
+                    ],
+                )
+            ],
+        )
+        await engine.run_agentic("Create token bucket")
+
+    task = engine.last_run_details["tasks"][0]
+    assert task["postcondition_check"]["ok"] is False
+    assert task["status"] == "failed"
+    assert engine.last_run_details["verifier"]["verdict"] == "fail"
+    assert "[POSTCONDITIONS]" in prompts[-1]
+
+
+@pytest.mark.asyncio
+async def test_run_records_context_trim_metrics():
+    model_adapter = MagicMock()
+    model_adapter.chat = AsyncMock(
+        return_value={
+            "choices": [{"message": {"content": "final answer"}}],
+            "usage": {},
+        }
+    )
+    tool_registry = MagicMock()
+    tool_registry.list_schemas.return_value = []
+    engine = QueryEngine(
+        model_adapter=model_adapter,
+        tool_registry=tool_registry,
+        max_iterations=2,
+        context_manager=ContextManager(max_tokens=40),
+    )
+
+    result = await engine._run_with_messages(
+        [
+            {"role": "system", "content": "system " * 20},
+            {"role": "user", "content": "a" * 200},
+            {"role": "assistant", "content": "b" * 200},
+            {"role": "user", "content": "c" * 200},
+        ],
+        prompt="c" * 200,
+        system_prompt="system " * 20,
+        iteration=0,
+    )
+
+    assert result == "final answer"
+    metrics = engine._context_metrics
+    assert metrics["messages_before_trim"] >= metrics["messages_after_trim"]
+    assert metrics["messages_dropped"] >= 1

@@ -11,6 +11,13 @@ RULES (non-negotiable):
 
 TOOLS:
 - read_file: inspect code (ALWAYS do this first)
+- list_python_symbols: inspect Python file structure before editing functions/classes
+- read_python_symbol: read a single Python function/class instead of the whole file when possible
+- replace_python_symbol: replace one Python function/class while preserving the rest of the file
+- build_python_edit_context: build focused Python edit context when the task is code-specific
+- list_js_symbols: inspect JS/TS file structure before editing top-level classes/functions
+- read_js_symbol: read a single JS/TS class/function instead of the whole file when possible
+- build_js_edit_context: build focused JS/TS edit context when the task is code-specific
 - edit_file: surgical string replacement in existing files
 - apply_edit: smarter replacement using SEARCH/REPLACE format with fuzzy matching (exact → whitespace-flexible → difflib); prefer this when edit_file fails
 - write_file: create new files only
@@ -29,6 +36,8 @@ WORKFLOW:
 
 EDITING RULES:
 - Prefer small, focused edits over rewriting entire files
+- For Python edits, prefer symbol-level tools before raw text replacement
+- For JS/TS edits, prefer semantic symbol/context tools before broad raw text replacement
 - When editing, include enough context in old_string to be unique
 - After editing, verify the change by reading the file again
 - If an edit fails (string not found), read the file to see current state

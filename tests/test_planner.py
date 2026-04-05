@@ -7,6 +7,7 @@ from mantis.core.planner import (
     TASK_PATTERNS,
     PlannedTask,
     ExecutionPlan,
+    _extract_postconditions,
     classify_task,
     _extract_file_targets,
     _split_atomic_chunks,
@@ -22,6 +23,9 @@ from mantis.core.planner import (
 class TestClassifyTask:
     def test_test_writing(self):
         assert classify_task("write pytest tests for the auth module") == "test_writing"
+
+    def test_test_mentions_without_writing_do_not_become_test_writing(self):
+        assert classify_task("reply only with the number of test functions in the file") != "test_writing"
 
     def test_refactor(self):
         assert classify_task("refactor the database layer") == "refactor"
@@ -42,9 +46,9 @@ class TestClassifyTask:
         assert classify_task("xyzzy foobar baz") == "unknown"
 
     def test_highest_count_wins(self):
-        # "test" appears twice, "fix" once => test_writing wins
+        # Bare mentions of "test" should not outweigh an explicit fix verb.
         result = classify_task("test the test and fix it")
-        assert result == "test_writing"
+        assert result == "bug_fix"
 
     def test_research(self):
         assert classify_task("research and compare database options") == "research"
@@ -117,6 +121,12 @@ class TestSplitAtomicChunks:
         assert chunks[1][1] is False
         assert chunks[2][1] is True
 
+    def test_reply_clause_stays_in_same_chunk(self):
+        chunks = _split_atomic_chunks(
+            "read tests/test_server_background.py and reply only with the number of test functions in the file"
+        )
+        assert len(chunks) == 1
+
 
 # ---------------------------------------------------------------------------
 # _infer_complexity
@@ -152,6 +162,7 @@ class TestDataclasses:
         assert d["prompt"] == "p"
         assert d["task_type"] == "feature"
         assert d["file_targets"] == []
+        assert d["postconditions"] == []
         assert d["dependencies"] == []
         assert d["estimated_scope"] == "atomic"
         assert d["needs_escalation"] is False
@@ -215,3 +226,33 @@ class TestBuildExecutionPlan:
         assert isinstance(d, dict)
         assert "tasks" in d
         assert isinstance(d["tasks"], list)
+
+    def test_read_and_reply_prompt_stays_single_task(self):
+        plan = build_execution_plan(
+            "read tests/test_server_background.py and reply only with the number of test functions in the file"
+        )
+        assert len(plan.tasks) == 1
+        assert plan.tasks[0].file_targets == ["tests/test_server_background.py"]
+
+
+class TestPostconditions:
+    def test_extracts_file_and_interface_postconditions(self):
+        conditions = _extract_postconditions(
+            "Create token_bucket.py implementing a TokenBucket class with methods __init__, allow(tokens: int = 1), available().",
+            ["token_bucket.py"],
+        )
+        assert "file exists: token_bucket.py" in conditions
+        assert "class exists: TokenBucket" in conditions
+        assert "method exists: __init__" in conditions
+        assert "method exists: allow" in conditions
+        assert "method exists: available" in conditions
+
+    def test_build_plan_attaches_postconditions_to_tasks(self):
+        plan = build_execution_plan(
+            "Create auth.ts implementing an AuthService class and createSession function."
+        )
+        assert len(plan.tasks) == 1
+        task = plan.tasks[0]
+        assert "file exists: auth.ts" in task.postconditions
+        assert "class exists: AuthService" in task.postconditions
+        assert "function exists: createSession" in task.postconditions

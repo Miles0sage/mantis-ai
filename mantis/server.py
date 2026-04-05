@@ -5,6 +5,8 @@ import json
 import os
 import asyncio
 import threading
+import subprocess
+import queue
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
@@ -13,6 +15,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
+from mantis.core.worktree_manager import collect_git_review, create_issue_worktree
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -163,6 +166,12 @@ class BackgroundJobRequest(BaseModel):
     prompt: str
     system_prompt: Optional[str] = None
     session_id: Optional[str] = None
+    issue_title: Optional[str] = None
+    issue_number: Optional[int] = None
+    repo_name: Optional[str] = None
+    use_worktree: bool = False
+    worktree_root_dir: Optional[str] = None
+    create_draft_pr: bool = False
 
 
 class ApprovalDecisionRequest(BaseModel):
@@ -171,6 +180,41 @@ class ApprovalDecisionRequest(BaseModel):
 
 _sessions: dict[str, "MantisApp"] = {}
 _job_tasks: dict[str, Any] = {}
+
+
+async def _run_coro_in_thread(awaitable_factory) -> Any:
+    """Run an async workload on a worker thread with its own event loop."""
+    return await asyncio.to_thread(lambda: asyncio.run(awaitable_factory()))
+
+
+async def _stream_asyncgen_in_thread(asyncgen_factory):
+    """Bridge an async generator from a worker thread into the FastAPI event loop."""
+    sentinel = object()
+    buffer: queue.Queue[Any] = queue.Queue()
+
+    async def _consume() -> None:
+        try:
+            async for item in asyncgen_factory():
+                buffer.put(item)
+        except Exception as exc:  # pragma: no cover - surfaced to caller below
+            buffer.put(exc)
+        finally:
+            buffer.put(sentinel)
+
+    thread = threading.Thread(
+        target=lambda: asyncio.run(_consume()),
+        daemon=True,
+        name="mantis-stream-worker",
+    )
+    thread.start()
+
+    while True:
+        item = await asyncio.to_thread(buffer.get)
+        if item is sentinel:
+            break
+        if isinstance(item, Exception):
+            raise item
+        yield item
 
 
 def _log_event(
@@ -191,6 +235,75 @@ def _log_event(
         approval_id=approval_id,
         metadata=metadata,
     )
+
+
+def _extract_execution_summary(stats: dict[str, Any] | None) -> dict[str, Any]:
+    stats = stats or {}
+    execution = stats.get("execution") or {}
+    return {
+        "execution_mode": execution.get("execution_mode"),
+        "tasks": execution.get("tasks") or [],
+        "verification": execution.get("verifier"),
+        "context": execution.get("context"),
+        "pr_review": execution.get("pr_review"),
+        "worktree": execution.get("worktree"),
+        "draft_pr": execution.get("draft_pr"),
+    }
+
+
+def _serialize_job(job: Any) -> dict[str, Any]:
+    payload = job.to_dict()
+    metadata = payload.get("metadata") or {}
+    execution = metadata.get("execution") or {}
+    approval = None
+    if metadata.get("approval_id") or metadata.get("tool_name"):
+        approval = {
+            "approval_id": metadata.get("approval_id"),
+            "tool_name": metadata.get("tool_name"),
+            "risk_level": metadata.get("risk_level"),
+            "status": "awaiting_approval" if payload.get("status") == "awaiting_approval" else None,
+        }
+    resume = None
+    if metadata.get("resumed_from_approval_id"):
+        resume = {
+            "approval_id": metadata.get("resumed_from_approval_id"),
+            "tool_name": metadata.get("resumed_tool_name"),
+            "note": metadata.get("resume_note"),
+        }
+    payload["tasks"] = execution.get("tasks") or (metadata.get("plan") or {}).get("tasks") or []
+    payload["verification"] = execution.get("verifier")
+    payload["execution_mode"] = execution.get("execution_mode")
+    payload["context"] = execution.get("context")
+    payload["pr_review"] = execution.get("pr_review") or metadata.get("pr_review")
+    payload["worktree"] = execution.get("worktree") or metadata.get("worktree")
+    payload["draft_pr"] = execution.get("draft_pr") or metadata.get("draft_pr")
+    payload["approval"] = approval
+    payload["resume"] = resume
+    return payload
+
+
+def _create_draft_pr_with_gh(
+    title: str,
+    body: str,
+    branch: str,
+    repo_name: str | None = None,
+) -> str:
+    cmd = ["gh", "pr", "create", "--draft", "--title", title, "--body", body, "--head", branch]
+    if repo_name:
+        cmd.extend(["--repo", repo_name])
+    try:
+        proc = subprocess.run(
+            cmd,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError("gh CLI is not installed or not on PATH") from e
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or "").strip()
+        raise RuntimeError(f"gh pr create failed: {stderr or e}") from e
+    return (proc.stdout or "").strip()
 
 
 def _get_session_app(session_id: str, cfg: dict[str, Any]) -> "MantisApp":
@@ -330,7 +443,9 @@ async def chat(body: ChatRequest):
         task_type = plan.tasks[0].task_type if plan.tasks else "unknown"
         subtasks_count = len(plan.tasks)
 
-        response = await app_instance._run_chat(body.prompt)
+        response = await _run_coro_in_thread(
+            lambda: app_instance._run_chat(body.prompt)
+        )
 
         return {
             "response": response,
@@ -338,6 +453,7 @@ async def chat(body: ChatRequest):
             "subtasks_count": subtasks_count,
             "model": app_instance.last_stats.get("model", cfg["model"]),
             "stats": app_instance.last_stats,
+            **_extract_execution_summary(app_instance.last_stats),
         }
 
     except HTTPException:
@@ -363,6 +479,17 @@ async def create_background_job(body: BackgroundJobRequest):
         plan = build_execution_plan(body.prompt)
         task_type = plan.tasks[0].task_type if plan.tasks else "unknown"
         subtasks_count = len(plan.tasks)
+        worktree_meta = None
+        project_dir = None
+        if body.use_worktree:
+            worktree_title = body.issue_title or body.prompt[:80]
+            worktree_meta = create_issue_worktree(
+                repo_dir=os.getcwd(),
+                title=worktree_title,
+                issue_number=body.issue_number,
+                root_dir=body.worktree_root_dir,
+            )
+            project_dir = worktree_meta["worktree_dir"]
 
         store = JobStore()
         job = store.create(
@@ -372,6 +499,10 @@ async def create_background_job(body: BackgroundJobRequest):
             task_type=task_type,
             subtasks_count=subtasks_count,
             plan=plan.to_dict(),
+            issue_title=body.issue_title,
+            issue_number=body.issue_number,
+            repo_name=body.repo_name,
+            worktree=worktree_meta,
         )
         _log_event(
             session_id=session_id,
@@ -383,6 +514,9 @@ async def create_background_job(body: BackgroundJobRequest):
 
         async def _runner() -> None:
             app_instance = _build_job_app(session_id, cfg)
+            if project_dir:
+                from mantis.app import MantisApp
+                app_instance = MantisApp(cfg, project_dir=project_dir, session_id=session_id)
             store.update(job.id, status="running")
             _log_event(
                 session_id=session_id,
@@ -392,6 +526,76 @@ async def create_background_job(body: BackgroundJobRequest):
             )
             try:
                 response = await app_instance._run_chat(body.prompt, job_id=job.id)
+                execution = app_instance.last_stats.setdefault("execution", {})
+                git_review = None
+                if worktree_meta:
+                    try:
+                        git_review = collect_git_review(worktree_meta["worktree_dir"])
+                    except RuntimeError:
+                        git_review = {
+                            "branch": worktree_meta["branch"],
+                            "path": worktree_meta["worktree_dir"],
+                            "changed_files": [],
+                            "diff": "",
+                        }
+                    execution["worktree"] = {
+                        "branch": git_review.get("branch"),
+                        "path": git_review.get("path"),
+                    }
+                if body.issue_title:
+                    verifier = execution.get("verifier") or {}
+                    changed_files = list((git_review or {}).get("changed_files") or [])
+                    if not changed_files:
+                        for task in execution.get("tasks") or []:
+                            for target in task.get("file_targets") or []:
+                                if target not in changed_files:
+                                    changed_files.append(target)
+                    execution["pr_review"] = {
+                        "title": f"[Issue #{body.issue_number}] {body.issue_title}" if body.issue_number is not None else body.issue_title,
+                        "changed_files": changed_files,
+                        "verdict": verifier.get("verdict"),
+                        "reason": verifier.get("reason"),
+                        "diff_preview": (git_review or {}).get("diff"),
+                    }
+                    if body.create_draft_pr:
+                        branch = (git_review or {}).get("branch")
+                        if branch:
+                            pr_lines = [
+                                f"PR title: {execution['pr_review']['title']}",
+                                "",
+                                "Changed files:",
+                            ]
+                            if changed_files:
+                                pr_lines.extend(f"- {path}" for path in changed_files)
+                            else:
+                                pr_lines.append("- (no tracked file targets)")
+                            pr_lines.extend(
+                                [
+                                    "",
+                                    "Verification:",
+                                    f"- verdict: {verifier.get('verdict') or 'unknown'}",
+                                    f"- reason: {verifier.get('reason') or 'not recorded'}",
+                                ]
+                            )
+                            pr_body = "\n".join(pr_lines)
+                            try:
+                                pr_url = _create_draft_pr_with_gh(
+                                    execution["pr_review"]["title"],
+                                    pr_body,
+                                    branch,
+                                    body.repo_name,
+                                )
+                                execution["draft_pr"] = {
+                                    "status": "created",
+                                    "url": pr_url,
+                                    "branch": branch,
+                                }
+                            except RuntimeError as exc:
+                                execution["draft_pr"] = {
+                                    "status": "error",
+                                    "error": str(exc),
+                                    "branch": branch,
+                                }
                 store.update(
                     job.id,
                     status="done",
@@ -419,6 +623,9 @@ async def create_background_job(body: BackgroundJobRequest):
                             "approval_id": exc.approval_id,
                             "tool_name": exc.tool_name,
                             "risk_level": exc.risk_level,
+                            "resumed_from_approval_id": None,
+                            "resumed_tool_name": None,
+                            "resume_note": None,
                         },
                     )
                     _log_event(
@@ -455,7 +662,7 @@ async def list_background_jobs(limit: int = 20):
     from mantis.core.job_store import JobStore
 
     store = JobStore()
-    jobs = [job.to_dict() for job in store.list(limit=limit)]
+    jobs = [_serialize_job(job) for job in store.list(limit=limit)]
     return {"jobs": jobs}
 
 
@@ -474,6 +681,14 @@ async def list_activity(session_id: Optional[str] = None, limit: int = 40):
 
     events = [event.to_dict() for event in ActivityStore().list(session_id=session_id, limit=limit)]
     return {"events": events}
+
+
+@app.get("/api/traces")
+async def list_traces(session_id: Optional[str] = None, limit: int = 40):
+    from mantis.core.trace_store import TraceStore
+
+    traces = [trace.to_dict() for trace in TraceStore().list(session_id=session_id, limit=limit)]
+    return {"traces": traces}
 
 
 @app.post("/api/approvals/{approval_id}/approve")
@@ -507,7 +722,20 @@ async def approve_request(approval_id: str, body: ApprovalDecisionRequest):
 
         async def _resume_runner() -> None:
             app_instance = _build_job_app(job.session_id, cfg)
-            jobs.update(job.id, status="running", error=None)
+            jobs.update(
+                job.id,
+                status="running",
+                error=None,
+                metadata={
+                    **job.metadata,
+                    "approval_id": approval_id,
+                    "tool_name": approval.tool_name,
+                    "risk_level": approval.risk_level,
+                    "resumed_from_approval_id": approval_id,
+                    "resumed_tool_name": approval.tool_name,
+                    "resume_note": body.note,
+                },
+            )
             _log_event(
                 session_id=approval.session_id,
                 event_type="job_resumed",
@@ -552,6 +780,9 @@ async def approve_request(approval_id: str, body: ApprovalDecisionRequest):
                             "approval_id": exc.approval_id,
                             "tool_name": exc.tool_name,
                             "risk_level": exc.risk_level,
+                            "resumed_from_approval_id": approval_id,
+                            "resumed_tool_name": approval.tool_name,
+                            "resume_note": body.note,
                         },
                     )
                     _log_event(
@@ -619,7 +850,7 @@ async def get_background_job(job_id: str):
     job = store.load(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    return job.to_dict()
+    return _serialize_job(job)
 
 
 @app.post("/api/jobs/{job_id}/resume")
@@ -662,13 +893,28 @@ async def chat_stream(body: ChatRequest):
 
         session_id = body.session_id or "default"
         app_instance = _get_session_app(session_id, cfg)
+        fast_path = app_instance._try_local_fast_path(body.prompt)
 
         system_prompt = body.system_prompt or build_system_prompt()
 
         async def generator():
-            async for chunk in app_instance.query_engine.run_streaming(
-                body.prompt,
-                system_prompt=system_prompt,
+            if fast_path is not None:
+                response, routing, execution = fast_path
+                file_targets = execution["tasks"][0].get("file_targets", []) if execution.get("tasks") else []
+                verifier_reason = (execution.get("verifier") or {}).get("reason") or "Local fast path completed."
+                task_type = routing.get("task_type", "review")
+                yield f'data: {json.dumps({"type": "status", "text": "Planning..."})}\n\n'
+                yield f'data: {json.dumps({"type": "plan", "tasks": [{"title": execution["tasks"][0]["title"], "task_type": task_type, "status": "pending", "file_targets": file_targets}], "execution_mode": "local_fast_path"})}\n\n'
+                for chunk in app_instance.query_engine._stream_response_chunks(response):
+                    yield f'data: {json.dumps({"type": "token", "content": chunk})}\n\n'
+                yield f'data: {json.dumps({"type": "done", "task_type": task_type, "subtasks": 1, "total_cost": 0.0, "remaining_budget_usd": cfg.get("budget_usd"), "execution_mode": "local_fast_path", "verifier_reason": verifier_reason, "verifier_verdict": "pass"})}\n\n'
+                return
+
+            async for chunk in _stream_asyncgen_in_thread(
+                lambda: app_instance.query_engine.run_streaming(
+                    body.prompt,
+                    system_prompt=system_prompt,
+                )
             ):
                 yield chunk
 

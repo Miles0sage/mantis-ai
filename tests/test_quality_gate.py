@@ -59,10 +59,20 @@ class TestVerifyOutput:
         score, _ = verify_output("bug_fix", patch)
         assert score == 0.8
 
+    def test_bug_fix_with_completion_signal(self):
+        score, reason = verify_output("bug_fix", "Updated the target file and tests passed after verification.")
+        assert score == 0.8
+        assert "completion" in reason.lower()
+
     def test_feature_with_class(self):
         code = "class MyFeature:\n    def __init__(self):\n        pass"
         score, _ = verify_output("feature", code)
         assert score == 0.85
+
+    def test_test_writing_with_completion_signal(self):
+        score, reason = verify_output("test_writing", "Created pytest coverage and verified tests passed.")
+        assert score == 0.8
+        assert "completion" in reason.lower()
 
     def test_feature_with_single_short_def_is_acceptable_not_good(self):
         code = "def helper():\n    return 1"
@@ -84,6 +94,11 @@ class TestVerifyOutput:
         text = "This is documentation. " * 20
         score, _ = verify_output("docs", text)
         assert score == 0.8
+
+    def test_refactor_with_completion_signal(self):
+        score, reason = verify_output("refactor", "Refactored payments.py and verified tests passed.")
+        assert score == 0.85
+        assert "refactor" in reason.lower()
 
     def test_unknown_task_type(self):
         score, reason = verify_output("unknown_type", "some reasonable output here, long enough to pass")

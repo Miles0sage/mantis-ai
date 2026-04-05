@@ -5,6 +5,7 @@ import tempfile
 import os
 from pathlib import Path
 
+from mantis.app import MantisApp
 from mantis.core.tool_registry import ToolRegistry
 from mantis.core.context_manager import ContextManager
 from mantis.memory.store import MemoryStore
@@ -430,3 +431,116 @@ class TestHookManager:
         )
 
         assert len(calls) == 2
+
+
+class TestMantisSemanticGuardrail:
+    def test_blocks_raw_python_edit_tools(self):
+        app = MantisApp({"api_key": "test-key"}, session_id="guardrail-test")
+
+        result = asyncio.get_event_loop().run_until_complete(
+            app.hook_manager.run_pre_tool(
+                "edit_file",
+                {
+                    "file_path": "/tmp/example.py",
+                    "old_string": "return 1",
+                    "new_string": "return 2",
+                },
+            )
+        )
+
+        assert result.decision == Decision.BLOCK
+        assert "replace_python_symbol" in result.reason
+
+    def test_allows_non_python_edit_tools(self):
+        app = MantisApp({"api_key": "test-key"}, session_id="guardrail-test")
+
+        result = asyncio.get_event_loop().run_until_complete(
+            app.hook_manager.run_pre_tool(
+                "edit_file",
+                {
+                    "file_path": "/tmp/example.md",
+                    "old_string": "a",
+                    "new_string": "b",
+                },
+            )
+        )
+
+        assert result.decision == Decision.ALLOW
+
+
+class TestMantisAppRouting:
+    def test_should_use_orchestrator_for_complex_multi_file_work(self):
+        app = object.__new__(MantisApp)
+
+        assert app._should_use_orchestrator(
+            {
+                "needs_escalation": False,
+                "task_count": 2,
+                "file_count": 3,
+                "complexity": "medium",
+            }
+        ) is True
+
+    def test_should_not_use_orchestrator_for_simple_single_file_read(self):
+        app = object.__new__(MantisApp)
+
+        assert app._should_use_orchestrator(
+            {
+                "needs_escalation": False,
+                "task_count": 2,
+                "file_count": 1,
+                "complexity": "low",
+            }
+        ) is False
+
+    def test_read_only_fast_path_counts_python_test_functions(self, tmp_path):
+        test_file = tmp_path / "sample_test_file.py"
+        test_file.write_text(
+            "def helper():\n    return 1\n\n"
+            "def test_one():\n    assert True\n\n"
+            "async def test_two():\n    assert True\n",
+            encoding="utf-8",
+        )
+
+        app = MantisApp({"api_key": "test-key"}, project_dir=str(tmp_path), session_id="fast-path")
+        result = asyncio.get_event_loop().run_until_complete(
+            app._run_chat(
+                "Read sample_test_file.py and reply only with the number of test functions in the file."
+            )
+        )
+
+        assert result == "2"
+        assert app.last_stats["routing"]["strategy"] == "local_fast_path"
+
+    def test_read_only_fast_path_lists_python_test_functions(self, tmp_path):
+        test_file = tmp_path / "sample_test_file.py"
+        test_file.write_text(
+            "def test_alpha():\n    assert True\n\n"
+            "def test_beta():\n    assert True\n",
+            encoding="utf-8",
+        )
+
+        app = MantisApp({"api_key": "test-key"}, project_dir=str(tmp_path), session_id="fast-path-list")
+        result = asyncio.get_event_loop().run_until_complete(
+            app._run_chat(
+                "Read sample_test_file.py and reply only with the names of the test functions."
+            )
+        )
+
+        assert result == "test_alpha\ntest_beta"
+        assert app.last_stats["execution"]["execution_mode"] == "local_fast_path"
+
+    def test_local_fast_path_updates_simple_return_value(self, tmp_path):
+        target = tmp_path / "edit_me.py"
+        target.write_text("def value():\n    return 1\n", encoding="utf-8")
+
+        app = MantisApp({"api_key": "test-key"}, project_dir=str(tmp_path), session_id="fast-path-edit")
+        result = asyncio.get_event_loop().run_until_complete(
+            app._run_chat(
+                f"Read {target.name}, change the return value from 1 to 2, verify the file was updated, and keep the final answer short."
+            )
+        )
+
+        assert result == "File updated: return value changed from 1 to 2."
+        assert target.read_text(encoding="utf-8") == "def value():\n    return 2\n"
+        assert app.last_stats["routing"]["strategy"] == "local_fast_path"

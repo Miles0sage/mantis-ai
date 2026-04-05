@@ -21,7 +21,7 @@ ARCHITECTURE_KEYWORDS = {
 }
 
 TASK_PATTERNS = {
-    "test_writing": r"(?i)\b(test|pytest|jest|spec|coverage|tdd|unit test)\b",
+    "test_writing": r"(?i)\b(?:write|add|create|generate|update|run|fix)\b[^\n.]{0,80}\b(?:test|tests|pytest|jest|spec|coverage|tdd|unit test)\b|\b(?:pytest|jest)\b",
     "refactor": r"(?i)\b(refactor|clean up|simplify|extract|reorganize|rename)\b",
     "boilerplate": r"(?i)\b(scaffold|boilerplate|template|landing page|starter|hello world)\b",
     "bug_fix": r"(?i)\b(fix|bug|error|broken|crash|failing|issue|debug)\b",
@@ -40,6 +40,7 @@ class PlannedTask:
     prompt: str
     task_type: str
     file_targets: list[str] = field(default_factory=list)
+    postconditions: list[str] = field(default_factory=list)
     dependencies: list[str] = field(default_factory=list)
     estimated_scope: str = "atomic"
     parallel_group: str = "default"
@@ -95,6 +96,56 @@ def classify_task(prompt: str) -> str:
     return max(scores.items(), key=lambda item: item[1])[0]
 
 
+def _extract_postconditions(chunk: str, file_targets: list[str]) -> list[str]:
+    """Extract explicit success conditions from the task text."""
+    postconditions: list[str] = []
+
+    for target in file_targets:
+        postconditions.append(f"file exists: {target}")
+
+    class_patterns = [
+        re.compile(r"\b([A-Z][A-Za-z0-9_]*) class\b"),
+        re.compile(r"\bclass ([A-Z][A-Za-z0-9_]*)\b"),
+    ]
+    seen_classes: list[str] = []
+    for pattern in class_patterns:
+        for match in pattern.findall(chunk):
+            if match not in seen_classes:
+                seen_classes.append(match)
+                postconditions.append(f"class exists: {match}")
+
+    seen_functions: list[str] = []
+    for match in re.findall(r"\b([a-z_][A-Za-z0-9_]*) function\b", chunk):
+        if match not in seen_functions:
+            seen_functions.append(match)
+            postconditions.append(f"function exists: {match}")
+    for match in re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", chunk):
+        if match not in seen_functions and match not in {"__init__", "allow", "available"}:
+            seen_functions.append(match)
+            postconditions.append(f"function exists: {match}")
+
+    method_block = re.search(r"methods? ([^.]+)", chunk, flags=re.IGNORECASE)
+    if method_block:
+        block = method_block.group(1)
+        method_names = re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(|,|$)", block)
+        seen_methods: list[str] = []
+        for match in method_names:
+            if match not in seen_methods:
+                seen_methods.append(match)
+                postconditions.append(f"method exists: {match}")
+
+    if re.search(r"\b(?:create|write|add).*\btest", chunk, flags=re.IGNORECASE):
+        postconditions.append("tests added or updated")
+    if re.search(r"\b(?:run|pass).*\bpytest|\btests?\b", chunk, flags=re.IGNORECASE):
+        postconditions.append("verification passes")
+
+    deduped: list[str] = []
+    for item in postconditions:
+        if item not in deduped:
+            deduped.append(item)
+    return deduped
+
+
 def _split_atomic_chunks(prompt: str) -> list[tuple[str, bool]]:
     """Split a prompt on connectors ('and then', 'then', ' and ').
 
@@ -133,9 +184,13 @@ def _split_atomic_chunks(prompt: str) -> list[tuple[str, bool]]:
         r"remove|delete|deploy|read|check|find|make)\b",
         re.IGNORECASE,
     )
+    _CONTINUATION = re.compile(
+        r"^\b(reply|return|report|tell|summarize|answer|list|show|give)\b",
+        re.IGNORECASE,
+    )
     merged: list[tuple[str, bool]] = []
     for chunk, dep in cleaned:
-        if merged and not _ACTION.search(chunk):
+        if merged and (not _ACTION.search(chunk) or _CONTINUATION.search(chunk)):
             # No primary action verb → append as continuation of previous chunk
             prev_chunk, prev_dep = merged[-1]
             merged[-1] = (prev_chunk + " and " + chunk, prev_dep)
@@ -196,11 +251,14 @@ def _make_subtask(
         else "serial"
     )
 
+    postconditions = _extract_postconditions(chunk, chunk_files)
+
     return PlannedTask(
         title=title,
         prompt=chunk,
         task_type=classify_task(chunk) or base_task_type,
         file_targets=chunk_files,
+        postconditions=postconditions,
         estimated_scope=estimated_scope,
         parallel_group=parallel_group,
         needs_escalation=needs_escalation,

@@ -9,6 +9,9 @@ import pytest
 from mantis.core.quality_gate import (
     _check_compilation,
     _check_tests,
+    _javascript_interface_findings,
+    _python_interface_findings,
+    _python_placeholder_findings,
     verify_cascade,
     verify_output,
     execute_with_quality_gate,
@@ -62,6 +65,14 @@ async def test_check_tests_no_test_files(tmp_path):
     f.write_text("x = 1\n")
     result = await _check_tests([str(f)], cwd=str(tmp_path))
     assert result is None  # no test files → skip tier
+
+
+@pytest.mark.asyncio
+async def test_check_tests_scopes_temp_targets_without_cwd(tmp_path):
+    f = tmp_path / "app.py"
+    f.write_text("x = 1\n")
+    result = await _check_tests([str(f)])
+    assert result is None
 
 
 @pytest.mark.asyncio
@@ -139,6 +150,151 @@ async def test_cascade_test_fail_scores_04(tmp_path, monkeypatch):
     score, reason = await verify_cascade("feature", "wrote it", [str(src)], cwd=str(tmp_path))
     assert score == 0.4
     assert "Tier 2 FAIL" in reason
+
+
+def test_python_placeholder_findings_detects_incomplete_defs(tmp_path):
+    f = tmp_path / "placeholder.py"
+    f.write_text(
+        "def todo():\n    pass\n\n"
+        "def later():\n    raise NotImplementedError()\n\n"
+        "class Pending:\n    pass\n",
+        encoding="utf-8",
+    )
+    findings = _python_placeholder_findings(str(f))
+    assert any("todo" in finding for finding in findings)
+    assert any("later" in finding for finding in findings)
+    assert any("Pending" in finding for finding in findings)
+
+
+def test_python_interface_findings_detect_missing_contract(tmp_path):
+    f = tmp_path / "token_bucket.py"
+    f.write_text(
+        "class WrongName:\n"
+        "    def available(self):\n"
+        "        return 1\n",
+        encoding="utf-8",
+    )
+    findings = _python_interface_findings(
+        "Create token_bucket.py implementing a TokenBucket class with methods __init__, allow(tokens: int = 1), available().",
+        [str(f)],
+    )
+    assert any("TokenBucket" in finding for finding in findings)
+    assert any("allow" in finding for finding in findings)
+
+
+def test_python_interface_findings_accepts_contract_across_multiple_targets(tmp_path):
+    a = tmp_path / "token_bucket.py"
+    b = tmp_path / "helpers.py"
+    a.write_text(
+        "class TokenBucket:\n"
+        "    def __init__(self):\n"
+        "        pass\n",
+        encoding="utf-8",
+    )
+    b.write_text(
+        "def allow(tokens: int = 1):\n"
+        "    return True\n\n"
+        "def available():\n"
+        "    return 1\n",
+        encoding="utf-8",
+    )
+    findings = _python_interface_findings(
+        "Create token_bucket.py implementing a TokenBucket class with methods __init__, allow(tokens: int = 1), available().",
+        [str(a), str(b)],
+    )
+    assert findings == []
+
+
+def test_javascript_interface_findings_detect_missing_contract(tmp_path):
+    f = tmp_path / "auth.ts"
+    f.write_text(
+        "export class WrongName {}\n"
+        "export function available() { return true; }\n",
+        encoding="utf-8",
+    )
+    findings = _javascript_interface_findings(
+        "Create auth.ts implementing an AuthService class and createSession function.",
+        [str(f)],
+    )
+    assert any("AuthService" in finding for finding in findings)
+    assert any("createSession" in finding for finding in findings)
+
+
+def test_javascript_interface_findings_accepts_contract_across_multiple_targets(tmp_path):
+    a = tmp_path / "auth.ts"
+    b = tmp_path / "session.ts"
+    a.write_text("export class AuthService {}\n", encoding="utf-8")
+    b.write_text("export function createSession() { return true; }\n", encoding="utf-8")
+    findings = _javascript_interface_findings(
+        "Create auth.ts implementing an AuthService class and createSession function.",
+        [str(a), str(b)],
+    )
+    assert findings == []
+
+
+@pytest.mark.asyncio
+async def test_cascade_incomplete_python_impl_fails_before_semantic_pass(tmp_path):
+    f = tmp_path / "placeholder.py"
+    f.write_text(
+        "def todo():\n    pass\n",
+        encoding="utf-8",
+    )
+    score, reason = await verify_cascade("feature", "written and saved", [str(f)])
+    assert score == 0.45
+    assert "Tier 2.5 FAIL" in reason
+
+
+@pytest.mark.asyncio
+async def test_cascade_missing_python_interface_fails_before_semantic_pass(tmp_path):
+    f = tmp_path / "token_bucket.py"
+    f.write_text(
+        "class WrongName:\n"
+        "    def available(self):\n"
+        "        return 1\n",
+        encoding="utf-8",
+    )
+    score, reason = await verify_cascade(
+        "feature",
+        "written and saved",
+        [str(f)],
+        prompt="Create token_bucket.py implementing a TokenBucket class with methods __init__, allow(tokens: int = 1), available().",
+    )
+    assert score == 0.46
+    assert "Tier 2.6 FAIL" in reason
+
+
+@pytest.mark.asyncio
+async def test_cascade_missing_javascript_interface_fails_before_semantic_pass(tmp_path):
+    f = tmp_path / "auth.ts"
+    f.write_text(
+        "export class WrongName {}\n"
+        "export function available() { return true; }\n",
+        encoding="utf-8",
+    )
+    score, reason = await verify_cascade(
+        "feature",
+        "written and saved",
+        [str(f)],
+        prompt="Create auth.ts implementing an AuthService class and createSession function.",
+    )
+    assert score == 0.47
+    assert "Tier 2.7 FAIL" in reason
+
+
+@pytest.mark.asyncio
+async def test_cascade_allows_multifile_interface_contract_when_targets_together_match(tmp_path):
+    a = tmp_path / "auth.ts"
+    b = tmp_path / "session.ts"
+    a.write_text("export class AuthService {}\n", encoding="utf-8")
+    b.write_text("export function createSession() { return true; }\n", encoding="utf-8")
+    score, reason = await verify_cascade(
+        "feature",
+        "written and saved",
+        [str(a), str(b)],
+        prompt="Create auth.ts implementing an AuthService class and createSession function.",
+    )
+    assert score >= 0.8
+    assert "Tier 2.7 FAIL" not in reason
 
 
 # ---------------------------------------------------------------------------

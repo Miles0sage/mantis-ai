@@ -25,5 +25,8 @@ dev = [
     "pytest-asyncio"
 ]
 
+[tool.setuptools.packages.find]
+include = ["mantis*"]
+
 [project.scripts]
 mantisai = "mantis.cli:main"
