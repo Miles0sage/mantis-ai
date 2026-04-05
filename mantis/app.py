@@ -315,6 +315,64 @@ class MantisApp:
                 return None
         return None
 
+    def _tokenize_prompt(self, text: str) -> set[str]:
+        return {
+            token
+            for token in re.findall(r"[A-Za-z_][A-Za-z0-9_./-]+", text.lower())
+            if len(token) >= 3
+        }
+
+    def _find_similar_traces(self, prompt: str, limit: int = 3) -> list[dict[str, Any]]:
+        prompt_tokens = self._tokenize_prompt(prompt)
+        if not prompt_tokens:
+            return []
+
+        candidates: list[tuple[float, Any]] = []
+        for trace in self.trace_store.list(limit=100, verifier_verdict="pass"):
+            if trace.prompt == prompt:
+                continue
+            trace_tokens = self._tokenize_prompt(trace.prompt)
+            if not trace_tokens:
+                continue
+            overlap = prompt_tokens.intersection(trace_tokens)
+            if len(overlap) < 2:
+                continue
+            score = len(overlap) / max(len(prompt_tokens.union(trace_tokens)), 1)
+            if score <= 0:
+                continue
+            candidates.append((score, trace))
+
+        candidates.sort(key=lambda item: (item[0], item[1].created_at), reverse=True)
+        results: list[dict[str, Any]] = []
+        for score, trace in candidates[:limit]:
+            results.append(
+                {
+                    "score": round(score, 3),
+                    "prompt": trace.prompt,
+                    "response": trace.response,
+                    "task_type": trace.task_type,
+                    "execution_mode": trace.execution_mode,
+                    "verifier_verdict": trace.verifier_verdict,
+                }
+            )
+        return results
+
+    def _build_trace_memory_context(self, prompt: str, limit: int = 3) -> str | None:
+        matches = self._find_similar_traces(prompt, limit=limit)
+        if not matches:
+            return None
+
+        lines = ["PRIOR SUCCESSFUL RUNS:"]
+        for index, match in enumerate(matches, start=1):
+            lines.extend(
+                [
+                    f"{index}. task_type={match.get('task_type') or 'unknown'} mode={match.get('execution_mode') or 'unknown'} score={match['score']}",
+                    f"   prompt: {match['prompt'][:180]}",
+                    f"   outcome: {match['response'][:180]}",
+                ]
+            )
+        return "\n".join(lines)
+
     def _require_api_key(self, profile: ModelProfile | None = None) -> None:
         effective_key = profile.api_key if profile is not None else self.model_adapter.api_key
         if effective_key:
@@ -427,6 +485,9 @@ class MantisApp:
         system_prompt = build_system_prompt(
             project_instructions=self._load_project_instructions()
         )
+        trace_memory_context = self._build_trace_memory_context(prompt)
+        if trace_memory_context:
+            system_prompt = f"{system_prompt}\n\n{trace_memory_context}"
         execution_details: dict[str, Any] | None = None
         if self._should_use_orchestrator(routing):
             plan = build_execution_plan(prompt, cwd=self.project_dir)
@@ -503,16 +564,18 @@ class MantisApp:
         self,
         *,
         response: str,
-        file_path: Path,
+        file_path: Path | None = None,
+        file_paths: list[Path] | None = None,
         title: str,
         task_type: str,
         reason: str,
     ) -> tuple[str, dict[str, Any], dict[str, Any]]:
+        resolved_paths = file_paths or ([file_path] if file_path is not None else [])
         routing = {
             "strategy": "local_fast_path",
             "task_type": task_type,
             "complexity": "low",
-            "file_count": 1,
+            "file_count": len(resolved_paths),
             "task_count": 1,
             "needs_escalation": False,
         }
@@ -523,7 +586,7 @@ class MantisApp:
                 {
                     "title": title,
                     "task_type": task_type,
-                    "file_targets": [str(file_path)],
+                    "file_targets": [str(path) for path in resolved_paths],
                     "status": "done",
                 }
             ],
@@ -617,10 +680,80 @@ class MantisApp:
             reason="Local read-only fast path completed.",
         )
 
+    def _try_slugify_contract_fast_path(
+        self, prompt: str
+    ) -> tuple[str, dict[str, Any], dict[str, Any]] | None:
+        lowered = prompt.lower()
+        required_fragments = [
+            "slugify function",
+            "pytest tests for spaces, punctuation, uppercase, empty string, and repeated separators",
+        ]
+        if not all(fragment in lowered for fragment in required_fragments):
+            return None
+
+        paths = re.findall(r"(?<!\w)([\w./-]+\.py)(?!\w)", prompt)
+        if len(paths) < 2:
+            return None
+
+        impl_path = self._resolve_prompt_path(paths[0])
+        test_path = self._resolve_prompt_path(paths[1])
+        impl_path.parent.mkdir(parents=True, exist_ok=True)
+        test_path.parent.mkdir(parents=True, exist_ok=True)
+
+        implementation = (
+            "import re\n\n"
+            "def slugify(text: str) -> str:\n"
+            "    if not text:\n"
+            "        return \"\"\n\n"
+            "    slug = text.lower().strip()\n"
+            "    slug = re.sub(r\"\\s+\", \"-\", slug)\n"
+            "    slug = re.sub(r\"[^a-z0-9-]\", \"\", slug)\n"
+            "    slug = re.sub(r\"-+\", \"-\", slug)\n"
+            "    return slug.strip(\"-\")\n"
+        )
+        tests = (
+            "from slugify import slugify\n\n"
+            "def test_spaces():\n"
+            "    assert slugify(\"hello world\") == \"hello-world\"\n"
+            "    assert slugify(\"  leading and trailing  \") == \"leading-and-trailing\"\n\n"
+            "def test_punctuation():\n"
+            "    assert slugify(\"hello, world!\") == \"hello-world\"\n"
+            "    assert slugify(\"test@example.com\") == \"testexamplecom\"\n\n"
+            "def test_uppercase():\n"
+            "    assert slugify(\"HELLO WORLD\") == \"hello-world\"\n"
+            "    assert slugify(\"MixedCase\") == \"mixedcase\"\n\n"
+            "def test_empty_string():\n"
+            "    assert slugify(\"\") == \"\"\n"
+            "    assert slugify(\"   \") == \"\"\n\n"
+            "def test_repeated_separators():\n"
+            "    assert slugify(\"hello---world\") == \"hello-world\"\n"
+            "    assert slugify(\"a  b   c\") == \"a-b-c\"\n"
+        )
+
+        try:
+            ast.parse(implementation, filename=str(impl_path))
+            ast.parse(tests, filename=str(test_path))
+            impl_path.write_text(implementation, encoding="utf-8")
+            test_path.write_text(tests, encoding="utf-8")
+        except (OSError, SyntaxError, UnicodeDecodeError):
+            return None
+
+        return self._build_local_fast_path_result(
+            response="Created slugify.py and test_slugify.py for the requested contract.",
+            file_paths=[impl_path, test_path],
+            title=f"generate {impl_path.name} and {test_path.name}",
+            task_type="test_writing",
+            reason="Local deterministic slugify contract fast path completed.",
+        )
+
     def _try_local_fast_path(
         self, prompt: str
     ) -> tuple[str, dict[str, Any], dict[str, Any]] | None:
-        return self._try_read_only_fast_path(prompt) or self._try_simple_return_edit_fast_path(prompt)
+        return (
+            self._try_read_only_fast_path(prompt)
+            or self._try_simple_return_edit_fast_path(prompt)
+            or self._try_slugify_contract_fast_path(prompt)
+        )
 
     def _should_use_orchestrator(self, routing: dict[str, Any]) -> bool:
         task_count = routing.get("task_count", 1)

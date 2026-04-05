@@ -544,3 +544,126 @@ class TestMantisAppRouting:
         assert result == "File updated: return value changed from 1 to 2."
         assert target.read_text(encoding="utf-8") == "def value():\n    return 2\n"
         assert app.last_stats["routing"]["strategy"] == "local_fast_path"
+
+    def test_local_fast_path_generates_slugify_contract(self, tmp_path):
+        impl = tmp_path / "slugify.py"
+        test_file = tmp_path / "test_slugify.py"
+
+        app = MantisApp({"api_key": "test-key"}, project_dir=str(tmp_path), session_id="fast-path-slugify")
+        result = asyncio.get_event_loop().run_until_complete(
+            app._run_chat(
+                f"Create {impl.name} with a slugify function and {test_file.name} with pytest tests for spaces, punctuation, uppercase, empty string, and repeated separators. Do not run pytest."
+            )
+        )
+
+        assert result == "Created slugify.py and test_slugify.py for the requested contract."
+        assert impl.exists()
+        assert test_file.exists()
+        assert "def slugify" in impl.read_text(encoding="utf-8")
+        assert "def test_punctuation" in test_file.read_text(encoding="utf-8")
+        assert app.last_stats["routing"]["strategy"] == "local_fast_path"
+        assert app.last_stats["routing"]["file_count"] == 2
+
+    def test_find_similar_traces_returns_successful_matches(self, tmp_path):
+        app = MantisApp({"api_key": "test-key"}, project_dir=str(tmp_path), session_id="trace-memory")
+        app.trace_store = type(app.trace_store)(tmp_path / "traces")
+        app.trace_store.create(
+            session_id="s1",
+            prompt="Fix auth service and formatter so pytest passes",
+            response="Updated auth service and formatter.",
+            stats={
+                "routing": {"task_type": "bug_fix"},
+                "execution": {
+                    "execution_mode": "coordinator_worker_verifier",
+                    "verifier": {"verdict": "pass"},
+                },
+            },
+        )
+        app.trace_store.create(
+            session_id="s2",
+            prompt="Read docs and summarize architecture",
+            response="Architecture summary.",
+            stats={
+                "routing": {"task_type": "review"},
+                "execution": {
+                    "execution_mode": "direct_agentic",
+                    "verifier": {"verdict": "pass"},
+                },
+            },
+        )
+
+        matches = app._find_similar_traces("Fix auth formatter so pytest passes", limit=3)
+
+        assert len(matches) == 1
+        assert matches[0]["task_type"] == "bug_fix"
+        assert matches[0]["execution_mode"] == "coordinator_worker_verifier"
+
+    def test_build_trace_memory_context_formats_matches(self, tmp_path):
+        app = MantisApp({"api_key": "test-key"}, project_dir=str(tmp_path), session_id="trace-memory-format")
+        app.trace_store = type(app.trace_store)(tmp_path / "traces")
+        app.trace_store.create(
+            session_id="s1",
+            prompt="Fix service formatter flow so pytest passes",
+            response="Updated service and formatter.",
+            stats={
+                "routing": {"task_type": "bug_fix"},
+                "execution": {
+                    "execution_mode": "coordinator_worker_verifier",
+                    "verifier": {"verdict": "pass"},
+                },
+            },
+        )
+
+        context = app._build_trace_memory_context("Fix formatter flow so pytest passes")
+
+        assert context is not None
+        assert "PRIOR SUCCESSFUL RUNS" in context
+        assert "task_type=bug_fix" in context
+        assert "Updated service and formatter." in context
+
+    def test_run_chat_injects_trace_memory_into_system_prompt(self, tmp_path, monkeypatch):
+        app = MantisApp({"api_key": "test-key"}, project_dir=str(tmp_path), session_id="trace-memory-run")
+        app.trace_store = type(app.trace_store)(tmp_path / "traces")
+        app.trace_store.create(
+            session_id="s1",
+            prompt="Fix formatter flow so pytest passes",
+            response="Updated formatter and service.",
+            stats={
+                "routing": {"task_type": "bug_fix"},
+                "execution": {
+                    "execution_mode": "direct_agentic",
+                    "verifier": {"verdict": "pass"},
+                },
+            },
+        )
+
+        captured = {}
+
+        async def fake_run_agentic(prompt, system_prompt=None):
+            captured["prompt"] = prompt
+            captured["system_prompt"] = system_prompt
+            app.query_engine.last_run_details = {
+                "execution_mode": "direct_agentic",
+                "task_count": 1,
+                "tasks": [],
+                "verifier": {"verdict": "pass", "reason": "ok"},
+            }
+            return "done"
+
+        monkeypatch.setattr(app.query_engine, "run_agentic", fake_run_agentic)
+        monkeypatch.setattr(app, "_resolve_model_for_prompt", lambda prompt: (app._select_model_profile(), {
+            "strategy": "explicit_override",
+            "task_type": "bug_fix",
+            "complexity": "low",
+            "file_count": 1,
+            "task_count": 1,
+            "needs_escalation": False,
+        }))
+        monkeypatch.setattr(app, "_should_use_orchestrator", lambda routing: False)
+
+        result = asyncio.get_event_loop().run_until_complete(
+            app._run_chat("Fix formatter service flow so pytest passes")
+        )
+
+        assert result == "done"
+        assert "PRIOR SUCCESSFUL RUNS" in captured["system_prompt"]

@@ -221,6 +221,68 @@ def test_prepare_worker_task_rewrites_paths_into_isolated_worktree(tmp_path, mon
     assert prepared["metadata"]["worktree"]["branch"].startswith("mantis/task-worker-1")
     assert prepared["metadata"]["file_targets"][0] == str(tmp_path / "wt" / "app" / "service.py")
     assert prepared["metadata"]["dependencies"] == ["Read spec"]
+    assert prepared["metadata"]["resume_metadata"]["resume_key"] == "worker-1"
+    assert prepared["metadata"]["resume_metadata"]["resumable"] is True
+    assert prepared["metadata"]["resume_metadata"]["prompt"] == "Fix app/service.py and keep tests/test_service.py passing."
+    assert "[WORKER ISOLATION]" in prepared["metadata"]["resume_metadata"]["execution_prompt"]
+
+
+def test_orchestrator_detects_overlapping_targets(tmp_path):
+    orchestrator = CoordinatorOrchestrator(
+        model_adapter=MagicMock(),
+        tool_registry=MagicMock(),
+        project_dir=str(tmp_path),
+    )
+    prepared = [
+        {
+            "metadata": {
+                "file_targets": [str(tmp_path / "app.py"), str(tmp_path / "tests" / "test_app.py")],
+            }
+        },
+        {
+            "metadata": {
+                "file_targets": [str(tmp_path / "app.py")],
+            }
+        },
+    ]
+
+    assert orchestrator._has_overlapping_targets(prepared) is True
+
+
+def test_orchestrator_enriches_worker_result_with_git_review(tmp_path, monkeypatch):
+    orchestrator = CoordinatorOrchestrator(
+        model_adapter=MagicMock(),
+        tool_registry=MagicMock(),
+        project_dir=str(tmp_path),
+    )
+    result = AgentResult(
+        agent_id="worker-1",
+        task="do thing",
+        output="ok",
+        status="completed",
+        duration_ms=20.0,
+        token_usage={},
+        metadata={
+            "project_dir": str(tmp_path / "wt"),
+            "worktree": {"branch": "mantis/task-1", "worktree_dir": str(tmp_path / "wt")},
+        },
+    )
+
+    monkeypatch.setattr(
+        "mantis.agents.orchestrator.collect_git_review",
+        lambda repo_dir: {
+            "branch": "mantis/task-1",
+            "path": str(tmp_path / "wt"),
+            "changed_files": ["app.py", "tests/test_app.py"],
+            "diff": "diff --git a/app.py b/app.py\n+return 2\n",
+        },
+    )
+
+    orchestrator._enrich_worker_result(result)
+
+    assert result.metadata["changed_files"] == ["app.py", "tests/test_app.py"]
+    assert "diff --git" in result.metadata["diff_preview"]
+    assert result.metadata["worktree"]["path"] == str(tmp_path / "wt")
 
 
 @pytest.mark.asyncio
@@ -257,6 +319,21 @@ async def test_orchestrator_execute_returns_worker_metadata():
                 "file_targets": ["app.py"],
                 "project_dir": "/tmp/wt",
                 "worktree": {"branch": "mantis/task-1", "worktree_dir": "/tmp/wt"},
+                "changed_files": ["app.py"],
+                "diff_preview": "diff --git a/app.py b/app.py\n+return 2\n",
+                "resume_metadata": {
+                    "resume_key": "worker-1",
+                    "task_index": 1,
+                    "title": "t",
+                    "prompt": "do thing",
+                    "execution_prompt": "do thing",
+                    "file_targets": ["app.py"],
+                    "dependencies": [],
+                    "project_dir": "/tmp/wt",
+                    "worktree_branch": "mantis/task-1",
+                    "worktree_dir": "/tmp/wt",
+                    "resumable": True,
+                },
             },
         )
     ]
@@ -274,3 +351,5 @@ async def test_orchestrator_execute_returns_worker_metadata():
     assert result.workers[0]["agent_id"] == "worker-1"
     assert result.workers[0]["worktree"]["branch"] == "mantis/task-1"
     assert result.workers[0]["project_dir"] == "/tmp/wt"
+    assert result.workers[0]["changed_files"] == ["app.py"]
+    assert result.workers[0]["resume_metadata"]["resume_key"] == "worker-1"

@@ -283,6 +283,80 @@ async def test_run_agentic_retries_when_generated_checker_fails(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_run_agentic_retries_when_generated_pytest_suite_fails_in_tmp_repo(tmp_path):
+    target = tmp_path / "slugify.py"
+    test_file = tmp_path / "test_slugify.py"
+    responses = iter(
+        [
+            "first pass",
+            "second pass",
+        ]
+    )
+    prompts = []
+
+    async def fake_run(prompt, system_prompt=None):
+        prompts.append(prompt)
+        text = next(responses)
+        if text == "first pass":
+            target.write_text(
+                "def slugify(text):\n"
+                "    return text.lower()\n",
+                encoding="utf-8",
+            )
+            test_file.write_text(
+                "from slugify import slugify\n\n"
+                "def test_spaces():\n"
+                "    assert slugify('hello world') == 'hello-world'\n",
+                encoding="utf-8",
+            )
+        else:
+            target.write_text(
+                "def slugify(text):\n"
+                "    return text.lower().replace(' ', '-')\n",
+                encoding="utf-8",
+            )
+            test_file.write_text(
+                "from slugify import slugify\n\n"
+                "def test_spaces():\n"
+                "    assert slugify('hello world') == 'hello-world'\n",
+                encoding="utf-8",
+            )
+        return text
+
+    engine = _make_engine()
+    engine.run = fake_run
+
+    async def _fake_cascade(*a, **kw):
+        return (0.9, "good")
+
+    with patch("mantis.core.query_engine.build_execution_plan") as mock_plan, \
+         patch("mantis.core.quality_gate.verify_output", return_value=(0.9, "good")), \
+         patch("mantis.core.quality_gate.verify_cascade", new=_fake_cascade):
+        from mantis.core.planner import ExecutionPlan, PlannedTask
+
+        mock_plan.return_value = ExecutionPlan(
+            task_type="test_writing",
+            complexity="medium",
+            can_run_in_parallel=False,
+            needs_escalation=False,
+            tasks=[
+                PlannedTask(
+                    title="slugify",
+                    prompt=f"Create {target} and {test_file}",
+                    task_type="test_writing",
+                    file_targets=[str(target), str(test_file)],
+                )
+            ],
+        )
+        result = await engine.run_agentic("Create slugify with pytest tests")
+
+    assert result == "second pass"
+    assert "[ARTIFACT VERIFICATION FEEDBACK]" in prompts[-1]
+    assert f"[FILE: {test_file}]" in prompts[-1]
+    assert "Generated pytest suite failed" in prompts[-1]
+
+
+@pytest.mark.asyncio
 async def test_run_agentic_adds_semantic_guidance_for_python_tasks(tmp_path):
     target = tmp_path / "sample.py"
     target.write_text(
@@ -328,6 +402,32 @@ async def test_run_agentic_adds_semantic_guidance_for_python_tasks(tmp_path):
     assert "[PYTHON EDIT STRATEGY]" in enriched
     assert "list_python_symbols" in enriched
     assert "replace_python_symbol" in enriched
+
+
+@pytest.mark.asyncio
+async def test_run_agentic_adds_strict_scope_guidance_for_test_writing(tmp_path):
+    engine = _make_engine("result")
+    target = tmp_path / "slugify.py"
+    test_file = tmp_path / "test_slugify.py"
+
+    with patch("mantis.core.query_engine.build_execution_plan") as mock_plan:
+        mock_plan.return_value.tasks = [
+            MagicMock(
+                prompt=f"Create {target} and {test_file} with pytest tests for spaces and punctuation",
+                file_targets=[str(target), str(test_file)],
+                task_type="test_writing",
+                needs_escalation=False,
+                postconditions=[],
+            )
+        ]
+        mock_plan.return_value.complexity = "medium"
+        with patch("mantis.core.quality_gate.verify_output", return_value=(0.9, "good")):
+            await engine.run_agentic("Create slugify and tests")
+
+    enriched = engine.run.call_args.args[0]
+    assert "[TEST WRITING STRATEGY]" in enriched
+    assert "Do not invent extra edge cases" in enriched
+    assert "smallest correct implementation" in enriched
 
 
 @pytest.mark.asyncio

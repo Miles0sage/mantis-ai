@@ -1,12 +1,12 @@
 # MantisAI
 
-**Cheap-by-default async coding agent with visible approvals, verifier-backed completion, and browser-first control.**
+**The coding agent for bounded engineering work: cheap routing, isolated workers, verifier-backed completion, and visible diffs.**
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-166%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-233%20passing-brightgreen)](tests/)
 
-MantisAI is a self-hosted coding agent built for cheap models first. It runs tasks in the background, pauses for approvals on risky actions, resumes from checkpoints, shows cost and execution state in a web dashboard, and verifies generated artifacts before calling a task done.
+MantisAI is a self-hosted coding product for bounded engineering work. Give it a concrete task and it routes to the cheapest safe path, isolates risky edits, pauses for approvals when needed, verifies the result, and shows its work in the dashboard.
 
 Point it at OpenAI-compatible providers like DeepSeek, Qwen, OpenAI, or local endpoints. No vendor lock-in.
 
@@ -23,13 +23,15 @@ export MANTIS_MODEL=gpt-4o-mini   # or deepseek-chat, qwen-plus, etc.
 mantisai chat
 ```
 
-That's it. You're running an async coding agent with routing, approvals, budgets, and a browser dashboard built in.
+That's it. You're running a bounded coding operator with routing, approvals, budgets, and a browser dashboard built in.
 
 ---
 
 ## Why Mantis
 
+- **Bounded by design** — strongest on concrete read, edit, fix, and refactor tasks
 - **Cheap by default** — route simple work to low-cost models and escalate only when needed
+- **Isolated workers** — risky multi-file work can run in separate worktrees with visible ownership
 - **Background jobs** — queue work, come back later, and resume from checkpoints
 - **Visible approvals** — risky commands and edits pause for review with previews and diffs
 - **Verifier-backed completion** — generated checks and tests are used as gates, not just narrative output
@@ -76,10 +78,16 @@ mantisai tools                         # list available tools
 
 - **Plan** — Mantis builds an execution plan from the prompt and detects file targets and complexity
 - **Route** — cheap models handle easy work; stronger models are reserved for costlier or riskier tasks
-- **Execute** — the agent uses file, search, and shell tools to complete the task
+- **Execute** — the agent uses file, search, shell, and isolated-worker paths to complete the task
 - **Verify** — generated check files and tests are run as artifact gates where applicable
 - **Pause and Resume** — risky actions enter the approval queue and resume the same job after review
 - **Track** — jobs, plans, cost, approvals, and activity are visible in the dashboard
+
+## What It Is Not
+
+Mantis is not positioned as a general autonomous software company or a magic open-ended repo surgeon.
+
+It is a practical coding product for tasks that can be scoped, checked, and reviewed.
 
 ---
 
@@ -119,6 +127,13 @@ The dashboard includes:
 - activity feed
 - hard budget display
 - verifier and artifact-check summaries
+
+## Current Proof
+
+- `233` tests passing
+- scenario benchmark green
+- stress benchmark green
+- curated live/provider benchmark green
 
 ---
 

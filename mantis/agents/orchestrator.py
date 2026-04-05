@@ -12,6 +12,7 @@ from mantis.agents.spawner import AgentSpawner
 from mantis.core.planner import ExecutionPlan
 from mantis.core.system_prompt import build_role_prompt
 from mantis.core.worktree_manager import (
+    collect_git_review,
     create_issue_worktree,
     is_git_repo,
     rewrite_prompt_paths_for_worktree,
@@ -92,7 +93,8 @@ class CoordinatorOrchestrator:
             cost_aware=True,
         )
         prepared = [self._prepare_worker_task(task, index) for index, task in enumerate(plan.tasks, start=1)]
-        if plan.can_run_in_parallel and len(prepared) > 1:
+        can_parallelize = plan.can_run_in_parallel and len(prepared) > 1 and not self._has_overlapping_targets(prepared)
+        if can_parallelize:
             results = await self.spawner.spawn_parallel(
                 prepared,
                 system_prompt=worker_prompt,
@@ -109,6 +111,8 @@ class CoordinatorOrchestrator:
                 )
                 for task_spec in prepared
             ]
+        for result in results:
+            self._enrich_worker_result(result)
         self._last_worker_results = results
         return [result.output for result in results]
 
@@ -123,11 +127,13 @@ class CoordinatorOrchestrator:
             system_prompt=worker_prompt,
             repeated_tool_call_limit=self.repeated_tool_call_limit,
         )
+        self._enrich_worker_result(result)
         self._last_worker_results = [result]
         return result.output
 
     def _prepare_worker_task(self, task: Any, index: int) -> dict[str, Any]:
         prompt = task.prompt
+        original_prompt = task.prompt
         file_targets = list(task.file_targets)
         worktree = None
         project_dir = self.project_dir
@@ -164,12 +170,23 @@ class CoordinatorOrchestrator:
         metadata = {
             "task_index": index,
             "title": task.title,
+            "prompt": prompt,
             "task_type": task.task_type,
             "dependencies": list(task.dependencies),
             "parallel_group": task.parallel_group,
             "file_targets": file_targets,
             "project_dir": project_dir,
             "worktree": worktree,
+            "resume_metadata": self._build_resume_metadata(
+                index=index,
+                title=task.title,
+                prompt=prompt,
+                original_prompt=original_prompt,
+                file_targets=file_targets,
+                dependencies=list(task.dependencies),
+                project_dir=project_dir,
+                worktree=worktree,
+            ),
         }
         return {
             "prompt": prompt,
@@ -227,10 +244,70 @@ class CoordinatorOrchestrator:
                     "project_dir": metadata.get("project_dir"),
                     "file_targets": metadata.get("file_targets") or [],
                     "worktree": metadata.get("worktree"),
+                    "changed_files": metadata.get("changed_files") or [],
+                    "diff_preview": metadata.get("diff_preview"),
+                    "resume_metadata": metadata.get("resume_metadata"),
                     "token_usage": result.token_usage,
                 }
             )
         return workers
+
+    def _build_resume_metadata(
+        self,
+        *,
+        index: int,
+        title: str,
+        prompt: str,
+        original_prompt: str,
+        file_targets: list[str],
+        dependencies: list[str],
+        project_dir: str | None,
+        worktree: dict[str, str] | None,
+    ) -> dict[str, Any]:
+        return {
+            "resume_key": f"worker-{index}",
+            "task_index": index,
+            "title": title,
+            "prompt": original_prompt,
+            "execution_prompt": prompt,
+            "file_targets": file_targets,
+            "dependencies": dependencies,
+            "project_dir": project_dir,
+            "worktree_branch": (worktree or {}).get("branch"),
+            "worktree_dir": (worktree or {}).get("worktree_dir"),
+            "resumable": True,
+        }
+
+    def _has_overlapping_targets(self, prepared: list[dict[str, Any]]) -> bool:
+        seen: set[str] = set()
+        for task_spec in prepared:
+            targets = {
+                str(Path(target).resolve())
+                for target in task_spec.get("metadata", {}).get("file_targets", [])
+            }
+            if seen.intersection(targets):
+                return True
+            seen.update(targets)
+        return False
+
+    def _enrich_worker_result(self, result: Any) -> None:
+        metadata = result.metadata or {}
+        project_dir = metadata.get("project_dir")
+        worktree = metadata.get("worktree")
+        if not project_dir or not worktree:
+            return
+        try:
+            git_review = collect_git_review(project_dir)
+        except RuntimeError:
+            return
+        metadata["changed_files"] = git_review.get("changed_files") or []
+        metadata["diff_preview"] = git_review.get("diff")
+        metadata["worktree"] = {
+            **worktree,
+            "path": git_review.get("path") or worktree.get("worktree_dir"),
+            "branch": git_review.get("branch") or worktree.get("branch"),
+        }
+        result.metadata = metadata
 
     def _combine_outputs(self, outputs: list[str]) -> str:
         if len(outputs) == 1:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import json
 
 import httpx
 import pytest
@@ -186,6 +187,68 @@ async def test_background_job_exposes_worktree_and_pr_review_metadata(tmp_path, 
 
 
 @pytest.mark.asyncio
+async def test_background_job_uses_explicit_repo_dir_for_worktree(tmp_path, monkeypatch):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+
+    async def fake_run_chat(self, prompt: str, job_id: str | None = None) -> str:
+        self.last_stats = {
+            "model": "gpt-4o-mini",
+            "provider": "openai-compatible",
+            "execution": {
+                "execution_mode": "direct_agentic",
+                "tasks": [],
+                "verifier": {"verdict": "pass", "reason": "Verified."},
+            },
+        }
+        return "updated"
+
+    create_calls = []
+    monkeypatch.setenv("MANTIS_API_KEY", "test-key")
+    monkeypatch.setattr("mantis.app.MantisApp._run_chat", fake_run_chat)
+
+    def fake_create_issue_worktree(repo_dir, title, issue_number=None, root_dir=None):
+        create_calls.append(repo_dir)
+        return {
+            "repo_dir": repo_dir,
+            "worktree_dir": str(tmp_path / "wt"),
+            "branch": "mantis/issue-2-week-2-real-run",
+            "base_branch": "HEAD",
+        }
+
+    monkeypatch.setattr("mantis.server.create_issue_worktree", fake_create_issue_worktree)
+    monkeypatch.setattr(
+        "mantis.server.collect_git_review",
+        lambda repo_dir: {
+            "branch": "mantis/issue-2-week-2-real-run",
+            "path": str(tmp_path / "wt"),
+            "changed_files": [],
+            "diff": "",
+        },
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            "/api/jobs",
+            json={
+                "prompt": "edit service.py",
+                "session_id": "bg-explicit-repo",
+                "repo_dir": str(repo_dir),
+                "use_worktree": True,
+                "worktree_root_dir": str(tmp_path / "worktrees"),
+            },
+        )
+        assert response.status_code == 200
+        job_id = response.json()["job_id"]
+        final_job = await _poll_job(client, job_id, {"done", "failed"})
+
+    assert final_job is not None
+    assert final_job["status"] == "done"
+    assert create_calls == [str(repo_dir)]
+
+
+@pytest.mark.asyncio
 async def test_chat_route_does_not_block_health_checks(monkeypatch):
     started = threading.Event()
     release = threading.Event()
@@ -217,6 +280,74 @@ async def test_chat_route_does_not_block_health_checks(monkeypatch):
 
     assert chat_response.status_code == 200
     assert chat_response.json()["response"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_rerun_failed_workers_creates_job_from_failed_worker_metadata(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    jobs_dir = tmp_path / ".mantisai" / "jobs"
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+    job_id = "job-failed-workers"
+    job_payload = {
+        "id": job_id,
+        "prompt": "original",
+        "session_id": "rerun-session",
+        "status": "failed",
+        "created_at": "2026-04-05T00:00:00+00:00",
+        "updated_at": "2026-04-05T00:00:00+00:00",
+        "response": None,
+        "error": "worker failed",
+        "model": "deepseek-chat",
+        "task_type": "feature",
+        "subtasks_count": 2,
+        "metadata": {
+            "execution": {
+                "workers": [
+                    {
+                        "agent_id": "worker-1",
+                        "status": "completed",
+                        "resume_metadata": {
+                            "resume_key": "worker-1",
+                            "prompt": "fix a.py",
+                            "project_dir": "/tmp/repo",
+                            "resumable": True,
+                        },
+                    },
+                    {
+                        "agent_id": "worker-2",
+                        "status": "failed",
+                        "resume_metadata": {
+                            "resume_key": "worker-2",
+                            "prompt": "fix b.py",
+                            "project_dir": "/tmp/repo",
+                            "resumable": True,
+                        },
+                    },
+                ]
+            }
+        },
+    }
+    (jobs_dir / f"{job_id}.json").write_text(json.dumps(job_payload), encoding="utf-8")
+
+    captured = {}
+
+    async def fake_create_background_job(body):
+        captured["prompt"] = body.prompt
+        captured["session_id"] = body.session_id
+        captured["repo_dir"] = body.repo_dir
+        return {"job_id": "rerun-job", "status": "queued"}
+
+    monkeypatch.setattr("mantis.server.create_background_job", fake_create_background_job)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(f"/api/jobs/{job_id}/rerun-failed-workers")
+
+    assert response.status_code == 200
+    assert response.json()["job_id"] == "rerun-job"
+    assert captured["prompt"] == "fix b.py"
+    assert captured["session_id"] == "rerun-session"
+    assert captured["repo_dir"] == "/tmp/repo"
 
 
 @pytest.mark.asyncio

@@ -913,11 +913,11 @@
     <div id="messages">
       <div id="empty-state">
         <div class="em-title">MantisAI</div>
-        <div class="em-sub">Configure your API key and start chatting</div>
+        <div class="em-sub">Bounded coding work with cheap routing, isolated workers, and verifier-backed completion</div>
       </div>
     </div>
     <div id="input-area">
-      <textarea id="prompt-input" rows="1" placeholder="Ask MantisAI anything… (Enter to send, Shift+Enter for newline)"></textarea>
+      <textarea id="prompt-input" rows="1" placeholder="Give Mantis a concrete coding task… (Enter to send, Shift+Enter for newline)"></textarea>
       <button class="btn" id="send-btn">Send</button>
     </div>
   </main>
@@ -1374,15 +1374,29 @@ function renderJobDetail(job) {
         worker.parallel_group ? `group ${worker.parallel_group}` : null,
         worker.dependencies?.length ? `deps ${worker.dependencies.join(', ')}` : null,
         worker.worktree?.branch ? `branch ${worker.worktree.branch}` : null,
+        worker.changed_files?.length ? `${worker.changed_files.length} changed files` : null,
         worker.duration_ms != null ? `${Math.round(worker.duration_ms)}ms` : null,
         worker.token_usage?.cost != null ? `$${Number(worker.token_usage.cost).toFixed(4)}` : null,
       ].filter(Boolean).join(' · ');
 
       main.appendChild(titleEl);
       main.appendChild(infoEl);
+      if (worker.changed_files?.length) {
+        const changedEl = document.createElement('div');
+        changedEl.className = 'job-plan-files';
+        changedEl.textContent = worker.changed_files.join(', ');
+        main.appendChild(changedEl);
+      }
       row.appendChild(dot);
       row.appendChild(main);
       workersWrap.appendChild(row);
+
+      if (worker.diff_preview) {
+        const diffEl = document.createElement('pre');
+        diffEl.className = 'approval-preview';
+        diffEl.textContent = worker.diff_preview;
+        workersWrap.appendChild(diffEl);
+      }
     });
     wrap.appendChild(workersWrap);
   }

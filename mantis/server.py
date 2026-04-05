@@ -169,6 +169,7 @@ class BackgroundJobRequest(BaseModel):
     issue_title: Optional[str] = None
     issue_number: Optional[int] = None
     repo_name: Optional[str] = None
+    repo_dir: Optional[str] = None
     use_worktree: bool = False
     worktree_root_dir: Optional[str] = None
     create_draft_pr: bool = False
@@ -483,10 +484,11 @@ async def create_background_job(body: BackgroundJobRequest):
         subtasks_count = len(plan.tasks)
         worktree_meta = None
         project_dir = None
+        repo_dir = body.repo_dir or os.getcwd()
         if body.use_worktree:
             worktree_title = body.issue_title or body.prompt[:80]
             worktree_meta = create_issue_worktree(
-                repo_dir=os.getcwd(),
+                repo_dir=repo_dir,
                 title=worktree_title,
                 issue_number=body.issue_number,
                 root_dir=body.worktree_root_dir,
@@ -881,6 +883,51 @@ async def resume_background_job(job_id: str):
         BackgroundJobRequest(
             prompt=job.prompt,
             session_id=job.session_id,
+        )
+    )
+
+
+@app.post("/api/jobs/{job_id}/rerun-failed-workers")
+async def rerun_failed_workers(job_id: str):
+    from mantis.core.job_store import JobStore
+
+    store = JobStore()
+    job = store.load(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    metadata = job.metadata or {}
+    execution = metadata.get("execution") or metadata
+    workers = execution.get("workers") or []
+    failed_workers = [
+        worker
+        for worker in workers
+        if str(worker.get("status", "")).lower() not in {"completed", "done", "pass"}
+    ]
+    if not failed_workers:
+        raise HTTPException(status_code=400, detail="No failed workers available to rerun")
+
+    prompts = []
+    repo_dir = None
+    for worker in failed_workers:
+        resume_metadata = worker.get("resume_metadata") or {}
+        prompt = resume_metadata.get("prompt")
+        if prompt:
+            prompts.append(prompt)
+        repo_dir = repo_dir or resume_metadata.get("project_dir")
+        worktree_dir = resume_metadata.get("worktree_dir")
+        if repo_dir is None and worktree_dir:
+            repo_dir = str(Path(worktree_dir).parent.parent)
+
+    if not prompts:
+        raise HTTPException(status_code=400, detail="Failed workers do not have rerun metadata")
+
+    rerun_prompt = "\n\nand then\n\n".join(prompts)
+    return await create_background_job(
+        BackgroundJobRequest(
+            prompt=rerun_prompt,
+            session_id=job.session_id,
+            repo_dir=repo_dir,
         )
     )
 

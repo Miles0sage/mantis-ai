@@ -8,13 +8,14 @@ import tempfile
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 
+from mantis.agents.orchestrator import CoordinatorOrchestrator
 from mantis.app import MantisApp
 from mantis.core.hooks import Decision
-from mantis.core.planner import build_execution_plan
+from mantis.core.planner import ExecutionPlan, PlannedTask, build_execution_plan
 from mantis.core.quality_gate import verify_cascade
 from mantis.server import app as server_app
 
@@ -1175,6 +1176,86 @@ async def scenario_model_approval_resume(root: Path) -> dict:
             )
 
 
+async def scenario_orchestrator_serializes_overlapping_targets(root: Path) -> dict:
+    started = time.perf_counter()
+    repo_dir = root / "orchestrator-overlap"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    target = repo_dir / "app.py"
+    target.write_text("def value():\n    return 1\n", encoding="utf-8")
+
+    model_adapter = MagicMock()
+    model_adapter.chat = AsyncMock(
+        return_value={
+            "choices": [
+                {
+                    "message": {
+                        "content": '{"verdict":"pass","reason":"looks good","missing":[]}'
+                    }
+                }
+            ]
+        }
+    )
+    tool_registry = MagicMock()
+    orchestrator = CoordinatorOrchestrator(
+        model_adapter=model_adapter,
+        tool_registry=tool_registry,
+        project_dir=str(repo_dir),
+        isolate_workers=False,
+    )
+    plan = ExecutionPlan(
+        task_type="feature",
+        complexity="medium",
+        can_run_in_parallel=True,
+        needs_escalation=False,
+        tasks=[
+            PlannedTask(title="edit app first", prompt="edit app.py first", task_type="feature", file_targets=[str(target)]),
+            PlannedTask(title="edit app second", prompt="edit app.py second", task_type="feature", file_targets=[str(target)]),
+        ],
+    )
+
+    async def fail_parallel(*args, **kwargs):
+        raise AssertionError("spawn_parallel should not be used for overlapping targets")
+
+    orchestrator.spawner.spawn_parallel = AsyncMock(side_effect=fail_parallel)
+    orchestrator.spawner.spawn = AsyncMock(
+        side_effect=[
+            MagicMock(
+                agent_id="worker-1",
+                output="first edit",
+                status="completed",
+                duration_ms=10.0,
+                token_usage={},
+                metadata={"file_targets": [str(target)]},
+            ),
+            MagicMock(
+                agent_id="worker-2",
+                output="second edit",
+                status="completed",
+                duration_ms=12.0,
+                token_usage={},
+                metadata={"file_targets": [str(target)]},
+            ),
+        ]
+    )
+
+    result = await orchestrator.execute("edit app twice", plan)
+    passed = (
+        result.verification.verdict == "pass"
+        and orchestrator.spawner.spawn.await_count == 2
+        and orchestrator.spawner.spawn_parallel.await_count == 0
+    )
+    return _record(
+        "orchestrator_serializes_overlapping_targets",
+        started,
+        passed,
+        {
+            "worker_count": len(result.workers),
+            "parallel_calls": orchestrator.spawner.spawn_parallel.await_count,
+            "serial_calls": orchestrator.spawner.spawn.await_count,
+        },
+    )
+
+
 async def run_once(include_server: bool = False) -> dict:
     root = Path(tempfile.mkdtemp(prefix="mantis-scenario-benchmark-"))
     results = []
@@ -1199,6 +1280,7 @@ async def run_once(include_server: bool = False) -> dict:
     results.append(await scenario_python_layered_feature_fail(root))
     results.append(await scenario_python_configured_service_pass(root))
     results.append(await scenario_python_cross_module_refactor_fail(root))
+    results.append(await scenario_orchestrator_serializes_overlapping_targets(root))
     if include_server:
         results.append(await scenario_background_job_complete(root))
         results.append(await scenario_model_approval_resume(root))

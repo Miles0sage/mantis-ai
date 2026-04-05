@@ -2,6 +2,7 @@ import asyncio
 import ast
 import inspect
 import json
+import os
 import subprocess
 import re
 from pathlib import Path
@@ -164,20 +165,36 @@ class QueryEngine:
             ]
         )
 
+    def _strict_test_writing_guidance(self, task: Any) -> str:
+        requested_files = ", ".join(task.file_targets) if task.file_targets else "the requested files"
+        return "\n".join(
+            [
+                "[TEST WRITING STRATEGY]",
+                f"Scope your work to {requested_files}.",
+                "Implement only the explicitly requested API and test cases.",
+                "Do not invent extra edge cases, optional features, or broader behavior contracts.",
+                "If you create tests, keep them aligned to the prompt rather than speculative coverage.",
+                "Prefer the smallest correct implementation that satisfies the stated requirements exactly.",
+            ]
+        )
+
     def _build_subtask_prompt(self, task: Any) -> str:
         subtask_prompt = task.prompt
-        if not task.file_targets:
+        if not task.file_targets and task.task_type != "test_writing":
             return subtask_prompt
 
-        primary_target = task.file_targets[0]
         prompt_parts: list[str] = []
-        if self._is_python_edit_task(task.task_type, task.file_targets):
+        if task.task_type == "test_writing":
+            prompt_parts.append(self._strict_test_writing_guidance(task))
+        primary_target = task.file_targets[0] if task.file_targets else None
+        if primary_target and self._is_python_edit_task(task.task_type, task.file_targets):
             prompt_parts.append(self._semantic_python_guidance(primary_target))
-        elif self._is_js_edit_task(task.task_type, task.file_targets):
+        elif primary_target and self._is_js_edit_task(task.task_type, task.file_targets):
             prompt_parts.append(self._semantic_js_guidance(primary_target))
-        file_ctx = build_edit_context(primary_target, subtask_prompt)
-        if not file_ctx.startswith("Error:"):
-            prompt_parts.append(file_ctx)
+        if task.file_targets:
+            file_ctx = build_edit_context(primary_target, subtask_prompt)
+            if not file_ctx.startswith("Error:"):
+                prompt_parts.append(file_ctx)
         if not prompt_parts:
             return subtask_prompt
         prompt_parts.append(subtask_prompt)
@@ -768,23 +785,23 @@ class QueryEngine:
                 return f"Generated checker failed for {check_file}: {(proc.stdout + proc.stderr).strip()[-400:]}"
 
         if test_files:
-            test_dir = Path(test_files[0].parent)
-            # Only run pytest if this looks like a real project test directory
-            # (has conftest.py, pyproject.toml, or setup.cfg — not a /tmp one-off)
-            has_test_setup = any(
-                (test_dir / marker).exists()
-                for marker in ("conftest.py", "pyproject.toml", "setup.cfg", "setup.py")
+            parent_candidates = [str(path.parent) for path in paths if path.exists()]
+            if parent_candidates:
+                common_parent = Path(os.path.commonpath(parent_candidates))
+            else:
+                common_parent = test_files[0].parent
+            proc = subprocess.run(
+                ["python", "-m", "pytest", "-q", *[str(path) for path in test_files]],
+                cwd=str(common_parent),
+                capture_output=True,
+                text=True,
+                timeout=60,
             )
-            if has_test_setup:
-                proc = subprocess.run(
-                    ["python", "-m", "pytest", "-q", str(test_files[0])],
-                    cwd=str(test_dir),
-                    capture_output=True,
-                    text=True,
-                    timeout=60,
+            if proc.returncode != 0:
+                return (
+                    f"Generated pytest suite failed in {common_parent}: "
+                    f"{(proc.stdout + proc.stderr).strip()[-400:]}"
                 )
-                if proc.returncode != 0:
-                    return f"Generated pytest suite failed in {test_dir}: {(proc.stdout + proc.stderr).strip()[-400:]}"
 
         return None
 
