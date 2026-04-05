@@ -584,7 +584,7 @@ async def test_run_suppresses_repeated_identical_tool_calls():
     result = await engine.run("count tests")
 
     assert result == "4"
-    assert executed == ["demo.py", "demo.py"]
+    assert executed == ["demo.py"]
 
 
 @pytest.mark.asyncio

@@ -15,13 +15,21 @@ Repo: `/root/mantis-ai`
 
 ## Headline Results
 
-- Full test suite: `217 passed`
-- Targeted routing/streaming suite: `95 passed`
+- Full test suite: `224 passed`
+- Targeted routing/streaming suite: `112 passed`
 - Scenario benchmark: `21/21` passed
 - Scenario benchmark with server flows: `23/23` passed
 - Stress benchmark: `50/50` loops green, `average_pass_rate: 1.0`
 - Live benchmark: 4/4 tasks completed successfully with verification
 - Curated real-provider benchmark: `9/10` passed
+
+## Agency Upgrades Added
+
+- Coordinator workers can now run in isolated git worktrees for multi-file orchestrated tasks.
+- Worker metadata is exposed in execution stats, jobs, traces, and the dashboard.
+- `run_bash` now supports an explicit `cwd`, and worker runs default it to the assigned project/worktree.
+- Identical tool-call suppression now stops repeated loops earlier.
+- Traces now record top-level execution mode, task type, and verifier verdict for filtering.
 
 ## Latency Notes
 
@@ -48,5 +56,6 @@ Repo: `/root/mantis-ai`
 
 - Model-backed tasks are still slower than they should be.
 - The curated real-provider set exposed one concrete miss: `token_bucket` returned an implementation that failed the checker (`9/10` overall).
+- A later curated live/provider rerun remained active for several minutes without completing, reinforcing that latency on model-backed paths is still the main production blocker.
 - Confidence is strongest on bounded tasks and benchmark fixtures, not on arbitrary open-ended repo surgery.
 - The next quality frontier is broader live edit/refactor coverage and further latency reduction on model-backed paths.

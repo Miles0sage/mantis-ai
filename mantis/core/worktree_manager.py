@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import subprocess
 from pathlib import Path
 
@@ -114,3 +115,58 @@ def collect_git_review(repo_dir: str, diff_limit: int = 4000) -> dict[str, objec
         "diff": diff,
         "path": str(repo_path),
     }
+
+
+def is_git_repo(repo_dir: str) -> bool:
+    repo_path = Path(repo_dir).resolve()
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_path), "rev-parse", "--is-inside-work-tree"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return False
+    return proc.stdout.strip() == "true"
+
+
+def map_repo_path_to_worktree(
+    repo_dir: str,
+    worktree_dir: str,
+    target_path: str,
+) -> str:
+    repo_path = Path(repo_dir).resolve()
+    worktree_path = Path(worktree_dir).resolve()
+    raw_target = Path(target_path)
+    if not raw_target.is_absolute():
+        return str((worktree_path / raw_target).resolve())
+
+    resolved = raw_target.resolve()
+    try:
+        relative = resolved.relative_to(repo_path)
+    except ValueError:
+        return str(resolved)
+    return str((worktree_path / relative).resolve())
+
+
+def rewrite_prompt_paths_for_worktree(
+    prompt: str,
+    repo_dir: str,
+    worktree_dir: str,
+    file_targets: list[str],
+) -> tuple[str, list[str]]:
+    rewritten_targets: list[str] = []
+    replacements: dict[str, str] = {}
+    for target in file_targets:
+        rewritten = map_repo_path_to_worktree(repo_dir, worktree_dir, target)
+        rewritten_targets.append(rewritten)
+        replacements[target] = rewritten
+        if not os.path.isabs(target):
+            replacements[str((Path(repo_dir) / target).resolve())] = rewritten
+
+    rewritten_prompt = prompt
+    for source, dest in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
+        rewritten_prompt = rewritten_prompt.replace(source, dest)
+
+    return rewritten_prompt, rewritten_targets

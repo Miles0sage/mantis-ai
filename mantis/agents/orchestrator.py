@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from dataclasses import dataclass
@@ -10,6 +11,11 @@ from typing import Any
 from mantis.agents.spawner import AgentSpawner
 from mantis.core.planner import ExecutionPlan
 from mantis.core.system_prompt import build_role_prompt
+from mantis.core.worktree_manager import (
+    create_issue_worktree,
+    is_git_repo,
+    rewrite_prompt_paths_for_worktree,
+)
 
 
 @dataclass
@@ -24,6 +30,7 @@ class OrchestrationResult:
     output: str
     worker_outputs: list[str]
     verification: VerificationResult
+    workers: list[dict[str, Any]]
     revised: bool = False
 
 
@@ -34,15 +41,24 @@ class CoordinatorOrchestrator:
         tool_registry,
         project_instructions: str | None = None,
         worker_model_adapter=None,
+        project_dir: str | None = None,
+        isolate_workers: bool = True,
+        worker_root_dir: str | None = None,
+        repeated_tool_call_limit: int = 2,
     ):
         self.model_adapter = model_adapter
         self.tool_registry = tool_registry
         self.project_instructions = project_instructions
+        self.project_dir = os.path.abspath(project_dir) if project_dir else None
+        self.isolate_workers = isolate_workers
+        self.worker_root_dir = worker_root_dir
+        self.repeated_tool_call_limit = repeated_tool_call_limit
         self.spawner = AgentSpawner(
             model_adapter=model_adapter,
             tool_registry=tool_registry,
             worker_model_adapter=worker_model_adapter,
         )
+        self._last_worker_results: list[Any] = []
 
     async def execute(self, prompt: str, plan: ExecutionPlan) -> OrchestrationResult:
         worker_outputs = await self._run_workers(plan)
@@ -65,6 +81,7 @@ class CoordinatorOrchestrator:
             output=combined,
             worker_outputs=worker_outputs,
             verification=verification,
+            workers=self._summarize_workers(self._last_worker_results),
             revised=revised,
         )
 
@@ -74,14 +91,25 @@ class CoordinatorOrchestrator:
             project_instructions=self.project_instructions,
             cost_aware=True,
         )
-        tasks = [task.prompt for task in plan.tasks]
-        if plan.can_run_in_parallel and len(tasks) > 1:
-            results = await self.spawner.spawn_parallel(tasks, system_prompt=worker_prompt)
+        prepared = [self._prepare_worker_task(task, index) for index, task in enumerate(plan.tasks, start=1)]
+        if plan.can_run_in_parallel and len(prepared) > 1:
+            results = await self.spawner.spawn_parallel(
+                prepared,
+                system_prompt=worker_prompt,
+                repeated_tool_call_limit=self.repeated_tool_call_limit,
+            )
         else:
             results = [
-                await self.spawner.spawn(task_prompt, system_prompt=worker_prompt)
-                for task_prompt in tasks
+                await self.spawner.spawn(
+                    task_spec["prompt"],
+                    system_prompt=worker_prompt,
+                    default_bash_cwd=task_spec.get("default_bash_cwd"),
+                    metadata=task_spec.get("metadata"),
+                    repeated_tool_call_limit=self.repeated_tool_call_limit,
+                )
+                for task_spec in prepared
             ]
+        self._last_worker_results = results
         return [result.output for result in results]
 
     async def _run_single_worker(self, prompt: str) -> str:
@@ -90,8 +118,119 @@ class CoordinatorOrchestrator:
             project_instructions=self.project_instructions,
             cost_aware=True,
         )
-        result = await self.spawner.spawn(prompt, system_prompt=worker_prompt)
+        result = await self.spawner.spawn(
+            prompt,
+            system_prompt=worker_prompt,
+            repeated_tool_call_limit=self.repeated_tool_call_limit,
+        )
+        self._last_worker_results = [result]
         return result.output
+
+    def _prepare_worker_task(self, task: Any, index: int) -> dict[str, Any]:
+        prompt = task.prompt
+        file_targets = list(task.file_targets)
+        worktree = None
+        project_dir = self.project_dir
+
+        if (
+            self.isolate_workers
+            and self.project_dir
+            and is_git_repo(self.project_dir)
+            and task.file_targets
+        ):
+            title = f"worker-{index}-{task.title}"
+            try:
+                worktree = create_issue_worktree(
+                    repo_dir=self.project_dir,
+                    title=title,
+                    root_dir=self.worker_root_dir,
+                )
+                prompt, file_targets = rewrite_prompt_paths_for_worktree(
+                    prompt,
+                    repo_dir=self.project_dir,
+                    worktree_dir=worktree["worktree_dir"],
+                    file_targets=file_targets,
+                )
+                project_dir = worktree["worktree_dir"]
+            except RuntimeError:
+                worktree = None
+
+        prompt = self._augment_worker_prompt(
+            prompt,
+            file_targets=file_targets,
+            project_dir=project_dir,
+            worktree=worktree,
+        )
+        metadata = {
+            "task_index": index,
+            "title": task.title,
+            "task_type": task.task_type,
+            "dependencies": list(task.dependencies),
+            "parallel_group": task.parallel_group,
+            "file_targets": file_targets,
+            "project_dir": project_dir,
+            "worktree": worktree,
+        }
+        return {
+            "prompt": prompt,
+            "default_bash_cwd": project_dir,
+            "metadata": metadata,
+        }
+
+    def _augment_worker_prompt(
+        self,
+        prompt: str,
+        *,
+        file_targets: list[str],
+        project_dir: str | None,
+        worktree: dict[str, str] | None,
+    ) -> str:
+        instructions = []
+        if worktree:
+            instructions.extend(
+                [
+                    "[WORKER ISOLATION]",
+                    f"Operate inside isolated worktree: {worktree['worktree_dir']}",
+                    f"Branch: {worktree['branch']}",
+                    "If you use run_bash, pass cwd with the worktree path or rely on the default worker cwd.",
+                    "Do not modify files outside the isolated worktree unless the task explicitly requires it.",
+                ]
+            )
+        elif project_dir:
+            instructions.extend(
+                [
+                    "[WORKER CONTEXT]",
+                    f"Project directory: {project_dir}",
+                    "Use absolute file paths when possible.",
+                ]
+            )
+        if file_targets:
+            instructions.append("Owned targets: " + ", ".join(file_targets))
+        if not instructions:
+            return prompt
+        return "\n".join(instructions) + "\n\n" + prompt
+
+    def _summarize_workers(self, results: list[Any]) -> list[dict[str, Any]]:
+        workers: list[dict[str, Any]] = []
+        for result in results:
+            metadata = result.metadata or {}
+            workers.append(
+                {
+                    "agent_id": result.agent_id,
+                    "status": result.status,
+                    "duration_ms": round(result.duration_ms, 2),
+                    "task_index": metadata.get("task_index"),
+                    "title": metadata.get("title"),
+                    "task_type": metadata.get("task_type"),
+                    "dependencies": metadata.get("dependencies") or [],
+                    "parallel_group": metadata.get("parallel_group"),
+                    "project_dir": metadata.get("project_dir"),
+                    "file_targets": metadata.get("file_targets") or [],
+                    "worktree": metadata.get("worktree"),
+                    "token_usage": result.token_usage,
+                }
+            )
+        return workers
 
     def _combine_outputs(self, outputs: list[str]) -> str:
         if len(outputs) == 1:

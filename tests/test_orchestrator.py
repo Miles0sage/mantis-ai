@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from mantis.agents.orchestrator import CoordinatorOrchestrator
+from mantis.agents.spawner import AgentResult
 from mantis.core.planner import ExecutionPlan, PlannedTask
 from mantis.core.system_prompt import build_role_prompt
 
@@ -182,3 +183,94 @@ async def test_orchestrator_rejects_failing_generated_checker(tmp_path):
 
     assert verification.verdict == "fail"
     assert any("generated checker failed" in item for item in verification.missing)
+
+
+def test_prepare_worker_task_rewrites_paths_into_isolated_worktree(tmp_path, monkeypatch):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    task = PlannedTask(
+        title="Edit service",
+        prompt="Fix app/service.py and keep tests/test_service.py passing.",
+        task_type="bug_fix",
+        file_targets=["app/service.py", "tests/test_service.py"],
+        dependencies=["Read spec"],
+        parallel_group="group-1",
+    )
+    orchestrator = CoordinatorOrchestrator(
+        model_adapter=MagicMock(),
+        tool_registry=MagicMock(),
+        project_dir=str(repo_dir),
+    )
+
+    monkeypatch.setattr("mantis.agents.orchestrator.is_git_repo", lambda repo_dir: True)
+    monkeypatch.setattr(
+        "mantis.agents.orchestrator.create_issue_worktree",
+        lambda repo_dir, title, root_dir=None: {
+            "repo_dir": repo_dir,
+            "worktree_dir": str(tmp_path / "wt"),
+            "branch": "mantis/task-worker-1-edit-service-abcd1234",
+            "base_branch": "HEAD",
+        },
+    )
+
+    prepared = orchestrator._prepare_worker_task(task, 1)
+
+    assert "[WORKER ISOLATION]" in prepared["prompt"]
+    assert str(tmp_path / "wt" / "app" / "service.py") in prepared["prompt"]
+    assert prepared["default_bash_cwd"] == str(tmp_path / "wt")
+    assert prepared["metadata"]["worktree"]["branch"].startswith("mantis/task-worker-1")
+    assert prepared["metadata"]["file_targets"][0] == str(tmp_path / "wt" / "app" / "service.py")
+    assert prepared["metadata"]["dependencies"] == ["Read spec"]
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_execute_returns_worker_metadata():
+    model_adapter = MagicMock()
+    model_adapter.chat = AsyncMock(
+        return_value={
+            "choices": [
+                {
+                    "message": {
+                        "content": '{"verdict":"pass","reason":"looks good","missing":[]}'
+                    }
+                }
+            ]
+        }
+    )
+    tool_registry = MagicMock()
+    orchestrator = CoordinatorOrchestrator(model_adapter=model_adapter, tool_registry=tool_registry)
+    orchestrator._run_workers = AsyncMock(return_value=["worker output"])
+    orchestrator._last_worker_results = [
+        AgentResult(
+            agent_id="worker-1",
+            task="do thing",
+            output="worker output",
+            status="completed",
+            duration_ms=123.4,
+            token_usage={"cost": 0.01},
+            metadata={
+                "task_index": 1,
+                "title": "t",
+                "task_type": "feature",
+                "dependencies": [],
+                "parallel_group": "serial",
+                "file_targets": ["app.py"],
+                "project_dir": "/tmp/wt",
+                "worktree": {"branch": "mantis/task-1", "worktree_dir": "/tmp/wt"},
+            },
+        )
+    ]
+
+    plan = ExecutionPlan(
+        task_type="feature",
+        complexity="high",
+        can_run_in_parallel=False,
+        needs_escalation=True,
+        tasks=[PlannedTask(title="t", prompt="do thing", task_type="feature")],
+    )
+
+    result = await orchestrator.execute("do thing", plan)
+
+    assert result.workers[0]["agent_id"] == "worker-1"
+    assert result.workers[0]["worktree"]["branch"] == "mantis/task-1"
+    assert result.workers[0]["project_dir"] == "/tmp/wt"

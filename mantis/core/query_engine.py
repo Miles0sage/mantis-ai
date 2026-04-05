@@ -34,6 +34,7 @@ class QueryEngine:
         model_adapter: ModelAdapter,
         tool_registry: ToolRegistry,
         max_iterations: int = 25,
+        repeated_tool_call_limit: int = 2,
         context_manager=None,
         hook_manager=None,
         permission_manager=None,
@@ -42,6 +43,7 @@ class QueryEngine:
         self.model_adapter = model_adapter
         self.tool_registry = tool_registry
         self.max_iterations = max_iterations
+        self.repeated_tool_call_limit = repeated_tool_call_limit
         self.context_manager = context_manager
         self.hook_manager = hook_manager
         self.permission_manager = permission_manager
@@ -525,7 +527,7 @@ class QueryEngine:
                     }
                 }
                 messages.append(assistant_msg)
-                if repeated_tool_calls >= 3:
+                if repeated_tool_calls >= self.repeated_tool_call_limit:
                     messages.append(
                         {
                             "role": "function",
@@ -580,7 +582,7 @@ class QueryEngine:
                         last_tool_key = tool_key
                         repeated_tool_calls = 1
 
-                    if repeated_tool_calls >= 3:
+                    if repeated_tool_calls >= self.repeated_tool_call_limit:
                         messages.append(
                             {
                                 "role": "tool",

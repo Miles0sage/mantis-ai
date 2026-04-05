@@ -202,7 +202,7 @@ async def edit_file(file_path: str, old_string: str, new_string: str) -> str:
         return f"Error editing file '{file_path}': {str(e)}"
 
 
-async def run_bash(command: str, timeout: int = 120) -> str:
+async def run_bash(command: str, timeout: int = 120, cwd: str | None = None) -> str:
     """
     Run a bash command and return its output.
     
@@ -217,7 +217,8 @@ async def run_bash(command: str, timeout: int = 120) -> str:
         process = await asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
+            cwd=cwd,
         )
         
         try:
@@ -491,7 +492,8 @@ def register_builtins(registry: ToolRegistry) -> None:
         "type": "object",
         "properties": {
             "command": {"type": "string", "description": "The bash command to execute"},
-            "timeout": {"type": "integer", "description": "Timeout in seconds", "default": 120}
+            "timeout": {"type": "integer", "description": "Timeout in seconds", "default": 120},
+            "cwd": {"type": "string", "description": "Optional working directory for the command"}
         },
         "required": ["command"]
     }

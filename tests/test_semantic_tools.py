@@ -131,3 +131,20 @@ def test_build_js_edit_context(tmp_path):
     assert "BillingService" in context
     assert "createInvoice" in context
     assert "add refund support" in context
+
+
+def test_run_bash_accepts_cwd(tmp_path):
+    registry = _make_registry()
+    workdir = tmp_path / "cwd-test"
+    workdir.mkdir()
+    (workdir / "marker.txt").write_text("ok\n", encoding="utf-8")
+
+    output = asyncio.run(
+        registry.get("run_bash").handler(
+            command="pwd && cat marker.txt",
+            cwd=str(workdir),
+        )
+    )
+
+    assert str(workdir) in output
+    assert "ok" in output

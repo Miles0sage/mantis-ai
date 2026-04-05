@@ -75,6 +75,7 @@ class MantisApp:
             model_adapter=self.model_adapter,
             tool_registry=self.tool_registry,
             max_iterations=self.config.get("max_iterations", 25),
+            repeated_tool_call_limit=self.config.get("repeated_tool_call_limit", 2),
             context_manager=self.context_manager,
             hook_manager=self.hook_manager,
             permission_manager=self.permission_manager,
@@ -434,6 +435,8 @@ class MantisApp:
                 tool_registry=self.tool_registry,
                 project_instructions=project_instructions,
                 worker_model_adapter=self._build_cheap_worker_adapter(),
+                project_dir=self.project_dir,
+                repeated_tool_call_limit=self.config.get("repeated_tool_call_limit", 2),
             )
             orchestration = await orchestrator.execute(prompt, plan)
             response = orchestration.output
@@ -462,6 +465,7 @@ class MantisApp:
                     "missing": orchestration.verification.missing,
                     "revised": orchestration.revised,
                 },
+                "workers": orchestration.workers,
             }
         else:
             response = await self.query_engine.run_agentic(prompt, system_prompt=system_prompt)

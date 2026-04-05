@@ -12,6 +12,7 @@ def test_extract_execution_summary_flattens_execution_payload():
             "tasks": [{"title": "plan", "task_type": "feature"}],
             "verifier": {"verdict": "pass", "reason": "All checks passed."},
             "context": {"max_messages_dropped": 2},
+            "workers": [{"agent_id": "worker-1", "title": "task one"}],
             "pr_review": {"title": "Add retry flow", "verdict": "pass"},
             "worktree": {"branch": "mantis/issue-12-add-retry-flow", "path": "/tmp/wt"},
             "draft_pr": {"status": "created", "url": "https://github.com/acme/api/pull/12"},
@@ -24,6 +25,7 @@ def test_extract_execution_summary_flattens_execution_payload():
     assert summary["tasks"][0]["task_type"] == "feature"
     assert summary["verification"]["verdict"] == "pass"
     assert summary["context"]["max_messages_dropped"] == 2
+    assert summary["workers"][0]["agent_id"] == "worker-1"
     assert summary["pr_review"]["title"] == "Add retry flow"
     assert summary["worktree"]["branch"] == "mantis/issue-12-add-retry-flow"
     assert summary["draft_pr"]["status"] == "created"
@@ -42,6 +44,7 @@ def test_serialize_job_exposes_top_level_verification_and_tasks():
                     "tasks": [{"title": "real task", "task_type": "bug_fix", "status": "done"}],
                     "verifier": {"verdict": "pass", "reason": "Verified."},
                     "context": {"last_trim": {"messages_dropped": 1}},
+                    "workers": [{"agent_id": "worker-1", "worktree": {"branch": "mantis/task-1"}}],
                     "pr_review": {"title": "Retry flow", "changed_files": ["app/service.py"]},
                     "worktree": {"branch": "mantis/issue-12-retry-flow", "path": "/tmp/wt"},
                     "draft_pr": {"status": "created", "url": "https://github.com/acme/api/pull/22"},
@@ -56,6 +59,7 @@ def test_serialize_job_exposes_top_level_verification_and_tasks():
     assert payload["verification"]["verdict"] == "pass"
     assert payload["tasks"][0]["title"] == "real task"
     assert payload["context"]["last_trim"]["messages_dropped"] == 1
+    assert payload["workers"][0]["worktree"]["branch"] == "mantis/task-1"
     assert payload["pr_review"]["title"] == "Retry flow"
     assert payload["worktree"]["branch"] == "mantis/issue-12-retry-flow"
     assert payload["draft_pr"]["status"] == "created"
@@ -107,3 +111,36 @@ def test_traces_endpoint_lists_session_traces(tmp_path, monkeypatch):
     payload = asyncio.run(list_traces(session_id="s1", limit=10))
     assert len(payload["traces"]) == 1
     assert payload["traces"][0]["prompt"] == "fix auth flow"
+
+
+def test_traces_endpoint_filters_by_execution_mode(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    store = TraceStore()
+    store.create(
+        session_id="s1",
+        prompt="refactor auth flow",
+        response="done",
+        stats={
+            "routing": {"task_type": "refactor"},
+            "execution": {
+                "execution_mode": "coordinator_worker_verifier",
+                "verifier": {"verdict": "pass"},
+            },
+        },
+    )
+    store.create(
+        session_id="s1",
+        prompt="read file",
+        response="ok",
+        stats={
+            "routing": {"task_type": "review"},
+            "execution": {
+                "execution_mode": "local_fast_path",
+                "verifier": {"verdict": "pass"},
+            },
+        },
+    )
+
+    payload = asyncio.run(list_traces(session_id="s1", execution_mode="coordinator_worker_verifier", limit=10))
+    assert len(payload["traces"]) == 1
+    assert payload["traces"][0]["execution_mode"] == "coordinator_worker_verifier"

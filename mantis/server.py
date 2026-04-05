@@ -245,6 +245,7 @@ def _extract_execution_summary(stats: dict[str, Any] | None) -> dict[str, Any]:
         "tasks": execution.get("tasks") or [],
         "verification": execution.get("verifier"),
         "context": execution.get("context"),
+        "workers": execution.get("workers"),
         "pr_review": execution.get("pr_review"),
         "worktree": execution.get("worktree"),
         "draft_pr": execution.get("draft_pr"),
@@ -274,6 +275,7 @@ def _serialize_job(job: Any) -> dict[str, Any]:
     payload["verification"] = execution.get("verifier")
     payload["execution_mode"] = execution.get("execution_mode")
     payload["context"] = execution.get("context")
+    payload["workers"] = execution.get("workers") or metadata.get("workers")
     payload["pr_review"] = execution.get("pr_review") or metadata.get("pr_review")
     payload["worktree"] = execution.get("worktree") or metadata.get("worktree")
     payload["draft_pr"] = execution.get("draft_pr") or metadata.get("draft_pr")
@@ -684,10 +686,23 @@ async def list_activity(session_id: Optional[str] = None, limit: int = 40):
 
 
 @app.get("/api/traces")
-async def list_traces(session_id: Optional[str] = None, limit: int = 40):
+async def list_traces(
+    session_id: Optional[str] = None,
+    limit: int = 40,
+    execution_mode: Optional[str] = None,
+    verifier_verdict: Optional[str] = None,
+):
     from mantis.core.trace_store import TraceStore
 
-    traces = [trace.to_dict() for trace in TraceStore().list(session_id=session_id, limit=limit)]
+    traces = [
+        trace.to_dict()
+        for trace in TraceStore().list(
+            session_id=session_id,
+            limit=limit,
+            execution_mode=execution_mode,
+            verifier_verdict=verifier_verdict,
+        )
+    ]
     return {"traces": traces}
 
 

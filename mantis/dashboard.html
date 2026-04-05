@@ -248,6 +248,18 @@
     line-height: 1.5;
   }
 
+  #traces-list {
+    font-size: 11px;
+    color: var(--text-dim);
+    max-height: 180px;
+    overflow-y: auto;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 6px 8px;
+    line-height: 1.5;
+  }
+
   .job-item {
     border-bottom: 1px solid var(--border);
     padding: 6px 0;
@@ -347,6 +359,11 @@
     padding: 7px 0;
   }
 
+  .trace-item {
+    border-bottom: 1px solid var(--border);
+    padding: 7px 0;
+  }
+
   .job-head {
     display: flex;
     align-items: center;
@@ -372,6 +389,28 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+
+  .job-meta-line,
+  .trace-meta {
+    margin-top: 5px;
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+
+  .job-note-line {
+    margin-top: 5px;
+    color: var(--text-dim);
+    font-size: 11px;
+    word-break: break-word;
+  }
+
+  .trace-prompt {
+    margin-top: 4px;
+    color: var(--text);
+    word-break: break-word;
   }
 
   .approval-meta {
@@ -820,12 +859,40 @@
 
     <div class="section-label">Background Jobs</div>
     <button class="btn btn-secondary" id="background-btn">Run In Background</button>
+    <div class="field-group" style="margin-top:10px">
+      <label for="issue-title-input">Issue Title</label>
+      <input id="issue-title-input" type="text" placeholder="Optional issue title" />
+
+      <label for="issue-number-input">Issue Number</label>
+      <input id="issue-number-input" type="number" min="1" step="1" placeholder="123" />
+
+      <label for="repo-name-input">Repo Name</label>
+      <input id="repo-name-input" type="text" placeholder="owner/repo" />
+
+      <label for="worktree-root-input">Worktree Root</label>
+      <input id="worktree-root-input" type="text" placeholder="/tmp/mantis-worktrees" />
+
+      <label style="display:flex;align-items:center;gap:8px;margin-top:8px;">
+        <input id="use-worktree-input" type="checkbox" />
+        <span>Use isolated worktree for issue workflow</span>
+      </label>
+
+      <label style="display:flex;align-items:center;gap:8px;margin-top:8px;">
+        <input id="create-draft-pr-input" type="checkbox" />
+        <span>Create draft PR after successful issue workflow</span>
+      </label>
+    </div>
     <div id="jobs-list">no jobs yet</div>
 
     <div class="divider"></div>
 
     <div class="section-label">Approvals</div>
     <div id="approvals-list">no approvals pending</div>
+
+    <div class="divider"></div>
+
+    <div class="section-label">Run Traces</div>
+    <div id="traces-list">no traces yet</div>
 
     <div class="divider"></div>
 
@@ -896,7 +963,14 @@ const $toolsList   = document.getElementById('tools-list');
 const $jobsList    = document.getElementById('jobs-list');
 const $approvalsList = document.getElementById('approvals-list');
 const $activityList = document.getElementById('activity-list');
+const $tracesList   = document.getElementById('traces-list');
 const $backgroundBtn = document.getElementById('background-btn');
+const $issueTitleInput = document.getElementById('issue-title-input');
+const $issueNumberInput = document.getElementById('issue-number-input');
+const $repoNameInput = document.getElementById('repo-name-input');
+const $worktreeRootInput = document.getElementById('worktree-root-input');
+const $useWorktreeInput = document.getElementById('use-worktree-input');
+const $createDraftPrInput = document.getElementById('create-draft-pr-input');
 
 const $taskTree     = document.getElementById('task-tree');
 const $taskTreeBody = document.getElementById('task-tree-body');
@@ -909,6 +983,7 @@ let isSending = false;
 let jobsPollHandle = null;
 let approvalsPollHandle = null;
 let activityPollHandle = null;
+let tracesPollHandle = null;
 const sessionId = (() => {
   const key = 'mantis_session_id';
   let existing = window.localStorage.getItem(key);
@@ -1161,10 +1236,45 @@ function renderJobs(jobs) {
     prompt.className = 'job-prompt';
     prompt.textContent = job.prompt;
 
+    const metaLine = document.createElement('div');
+    metaLine.className = 'job-meta-line';
+    const metaBadges = [
+      job.execution_mode ? { cls: 'badge badge-type', text: job.execution_mode === 'coordinator_worker_verifier' ? 'coord+verify' : job.execution_mode } : null,
+      job.verification?.verdict ? { cls: `badge badge-model`, text: `verifier ${job.verification.verdict}` } : null,
+      Array.isArray(job.workers) && job.workers.length ? { cls: 'badge badge-tasks', text: `${job.workers.length} workers` } : null,
+      job.pr_review?.title ? { cls: 'badge badge-model', text: 'pr bundle' } : null,
+      job.worktree?.branch ? { cls: 'badge badge-type', text: `worktree ${job.worktree.branch}` } : null,
+      job.context?.max_messages_dropped ? { cls: 'badge badge-tasks', text: `context -${job.context.max_messages_dropped}` } : null,
+      job.approval?.tool_name ? { cls: 'badge badge-type', text: `approval ${job.approval.tool_name}` } : null,
+      job.resume?.tool_name ? { cls: 'badge badge-model', text: `resumed ${job.resume.tool_name}` } : null,
+      Array.isArray(job.tasks) && job.tasks.length ? { cls: 'badge badge-tasks', text: `${job.tasks.length} tasks` } : null,
+    ].filter(Boolean);
+    metaBadges.forEach(({ cls, text }) => {
+      const badge = document.createElement('span');
+      badge.className = cls;
+      badge.textContent = text;
+      metaLine.appendChild(badge);
+    });
+
     head.appendChild(status);
     head.appendChild(meta);
     item.appendChild(head);
     item.appendChild(prompt);
+    if (metaBadges.length) item.appendChild(metaLine);
+    const noteLines = [
+      job.status === 'awaiting_approval' && job.approval?.tool_name
+        ? `Paused for approval: ${job.approval.tool_name}${job.approval.risk_level ? ` (${job.approval.risk_level.toLowerCase()})` : ''}`
+        : null,
+      job.status === 'running' && job.resume?.tool_name
+        ? `Resumed from approval: ${job.resume.tool_name}${job.resume.note ? ` · ${job.resume.note}` : ''}`
+        : null,
+    ].filter(Boolean);
+    noteLines.forEach(text => {
+      const line = document.createElement('div');
+      line.className = 'job-note-line';
+      line.textContent = text;
+      item.appendChild(line);
+    });
     const detail = renderJobDetail(job);
     if (detail) item.appendChild(detail);
 
@@ -1182,8 +1292,14 @@ function renderJobDetail(job) {
   const metadata = job.metadata || {};
   const plan = metadata.plan;
   const execution = metadata.execution;
-  const verifier = execution?.verifier;
-  if (!plan && !execution) return null;
+  const verifier = job.verification || execution?.verifier;
+  const context = job.context || execution?.context;
+  const workers = job.workers || execution?.workers || [];
+  const prReview = job.pr_review || execution?.pr_review;
+  const worktree = job.worktree || execution?.worktree;
+  const draftPr = job.draft_pr || execution?.draft_pr;
+  const taskList = job.tasks || execution?.tasks || plan?.tasks || [];
+  if (!plan && !execution && taskList.length === 0 && workers.length === 0 && !verifier && !context && !prReview && !worktree && !draftPr) return null;
 
   const wrap = document.createElement('div');
   wrap.className = 'job-detail';
@@ -1195,7 +1311,6 @@ function renderJobDetail(job) {
 
   const planWrap = document.createElement('div');
   planWrap.className = 'job-plan';
-  const taskList = execution?.tasks || plan?.tasks || [];
   taskList.forEach(task => {
     const row = document.createElement('div');
     row.className = 'job-plan-row';
@@ -1215,7 +1330,10 @@ function renderJobDetail(job) {
     const detailParts = [
       task.task_type || null,
       (task.file_targets || []).length ? task.file_targets.join(', ') : null,
+      (task.postconditions || []).length ? `expects: ${(task.postconditions || []).join('; ')}` : null,
       task.artifact_check?.message || null,
+      task.postcondition_check?.message || null,
+      task.context?.messages_dropped ? `context trimmed ${task.context.messages_dropped}` : null,
     ].filter(Boolean);
     files.textContent = detailParts.join(' · ');
 
@@ -1227,6 +1345,48 @@ function renderJobDetail(job) {
   });
   wrap.appendChild(planWrap);
 
+  if (workers.length) {
+    const workersTitle = document.createElement('div');
+    workersTitle.className = 'job-detail-title';
+    workersTitle.textContent = 'Workers';
+    wrap.appendChild(workersTitle);
+
+    const workersWrap = document.createElement('div');
+    workersWrap.className = 'job-plan';
+    workers.forEach(worker => {
+      const row = document.createElement('div');
+      row.className = 'job-plan-row';
+
+      const dot = document.createElement('span');
+      dot.className = `job-plan-dot ${worker.status || 'done'}`;
+
+      const main = document.createElement('div');
+      main.className = 'job-plan-main';
+
+      const titleEl = document.createElement('div');
+      titleEl.className = 'job-plan-title';
+      titleEl.textContent = worker.title || worker.agent_id || 'worker';
+
+      const infoEl = document.createElement('div');
+      infoEl.className = 'job-plan-files';
+      infoEl.textContent = [
+        worker.task_type || null,
+        worker.parallel_group ? `group ${worker.parallel_group}` : null,
+        worker.dependencies?.length ? `deps ${worker.dependencies.join(', ')}` : null,
+        worker.worktree?.branch ? `branch ${worker.worktree.branch}` : null,
+        worker.duration_ms != null ? `${Math.round(worker.duration_ms)}ms` : null,
+        worker.token_usage?.cost != null ? `$${Number(worker.token_usage.cost).toFixed(4)}` : null,
+      ].filter(Boolean).join(' · ');
+
+      main.appendChild(titleEl);
+      main.appendChild(infoEl);
+      row.appendChild(dot);
+      row.appendChild(main);
+      workersWrap.appendChild(row);
+    });
+    wrap.appendChild(workersWrap);
+  }
+
   if (verifier) {
     const verifierEl = document.createElement('div');
     verifierEl.className = `job-verifier ${(verifier.verdict || 'pass').toLowerCase()}`;
@@ -1237,6 +1397,63 @@ function renderJobDetail(job) {
       verifier.revised ? 'Revision pass was required.' : null,
     ].filter(Boolean).join(' · ');
     wrap.appendChild(verifierEl);
+  }
+
+  if (context) {
+    const contextEl = document.createElement('div');
+    contextEl.className = 'job-verifier';
+    contextEl.textContent = [
+      'Context',
+      context.max_messages_dropped ? `max dropped ${context.max_messages_dropped}` : null,
+      context.last_trim?.messages_after_trim != null ? `kept ${context.last_trim.messages_after_trim} msgs` : null,
+      context.last_trim?.estimated_tokens_after_trim != null ? `~${context.last_trim.estimated_tokens_after_trim} tokens` : null,
+    ].filter(Boolean).join(' · ');
+    wrap.appendChild(contextEl);
+  }
+
+  if (worktree) {
+    const worktreeEl = document.createElement('div');
+    worktreeEl.className = 'job-verifier';
+    worktreeEl.textContent = [
+      'Worktree',
+      worktree.branch ? `branch ${worktree.branch}` : null,
+      worktree.path ? worktree.path : null,
+    ].filter(Boolean).join(' · ');
+    wrap.appendChild(worktreeEl);
+  }
+
+  if (prReview) {
+    const prEl = document.createElement('div');
+    prEl.className = 'job-verifier';
+    prEl.textContent = [
+      'PR Review',
+      prReview.title ? `title ${prReview.title}` : null,
+      Array.isArray(prReview.changed_files) && prReview.changed_files.length
+        ? `files ${prReview.changed_files.join(', ')}`
+        : null,
+      prReview.verdict ? `verdict ${prReview.verdict}` : null,
+    ].filter(Boolean).join(' · ');
+    wrap.appendChild(prEl);
+
+    if (prReview.diff_preview) {
+      const diffEl = document.createElement('pre');
+      diffEl.className = 'approval-preview';
+      diffEl.textContent = prReview.diff_preview;
+      wrap.appendChild(diffEl);
+    }
+  }
+
+  if (draftPr) {
+    const draftEl = document.createElement('div');
+    draftEl.className = `job-verifier ${draftPr.status === 'error' ? 'fail' : 'pass'}`;
+    draftEl.textContent = [
+      'Draft PR',
+      draftPr.status || null,
+      draftPr.branch ? `branch ${draftPr.branch}` : null,
+      draftPr.url ? draftPr.url : null,
+      draftPr.error ? draftPr.error : null,
+    ].filter(Boolean).join(' · ');
+    wrap.appendChild(draftEl);
   }
 
   return wrap;
@@ -1307,6 +1524,45 @@ function renderApprovals(approvals) {
     item.appendChild(note);
     item.appendChild(actions);
     $approvalsList.appendChild(item);
+  });
+}
+
+function renderTraces(traces) {
+  if (!traces || traces.length === 0) {
+    $tracesList.textContent = 'no traces yet';
+    return;
+  }
+
+  $tracesList.innerHTML = '';
+  traces.forEach(trace => {
+    const item = document.createElement('div');
+    item.className = 'trace-item';
+
+    const meta = document.createElement('div');
+    meta.className = 'trace-meta';
+    const badges = [
+      trace.model ? { cls: 'badge badge-model', text: trace.model } : null,
+      trace.execution_mode ? { cls: 'badge badge-type', text: trace.execution_mode } : null,
+      trace.task_type ? { cls: 'badge badge-tasks', text: trace.task_type } : null,
+      trace.stats?.execution?.verifier?.verdict ? { cls: 'badge badge-type', text: `verifier ${trace.stats.execution.verifier.verdict}` } : null,
+      trace.stats?.execution?.context?.max_messages_dropped ? { cls: 'badge badge-tasks', text: `context -${trace.stats.execution.context.max_messages_dropped}` } : null,
+      trace.job_id ? { cls: 'badge badge-tasks', text: `job ${trace.job_id.slice(0, 8)}` } : null,
+    ].filter(Boolean);
+    badges.forEach(({ cls, text }) => {
+      const badge = document.createElement('span');
+      badge.className = cls;
+      badge.textContent = text;
+      meta.appendChild(badge);
+    });
+
+    const prompt = document.createElement('div');
+    prompt.className = 'trace-prompt';
+    prompt.textContent = trace.prompt;
+
+    item.appendChild(meta);
+    item.appendChild(prompt);
+    if (trace.response) item.title = trace.response.slice(0, 400);
+    $tracesList.appendChild(item);
   });
 }
 
@@ -1388,6 +1644,17 @@ async function loadActivity() {
   }
 }
 
+async function loadTraces() {
+  try {
+    const res = await fetch(`/api/traces?session_id=${encodeURIComponent(sessionId)}&limit=20`);
+    if (!res.ok) return;
+    const data = await res.json();
+    renderTraces(data.traces || []);
+  } catch (e) {
+    console.error('loadTraces error', e);
+  }
+}
+
 async function decideApproval(approvalId, action, note = '') {
   try {
     const res = await fetch(`/api/approvals/${approvalId}/${action}`, {
@@ -1401,7 +1668,7 @@ async function decideApproval(approvalId, action, note = '') {
       return;
     }
     await Promise.all([loadApprovals(), loadJobs()]);
-    await loadActivity();
+    await Promise.all([loadActivity(), loadTraces()]);
     if (action === 'approve') {
       appendMessage('assistant', 'approval granted. the job resumed from its checkpoint and will continue in the background.');
     } else {
@@ -1650,20 +1917,42 @@ async function sendBackgroundJob() {
   const prompt = $promptInput.value.trim();
   if (!prompt || isSending) return;
 
+  const issueTitle = $issueTitleInput.value.trim();
+  const issueNumberRaw = $issueNumberInput.value.trim();
+  const repoName = $repoNameInput.value.trim();
+  const worktreeRootDir = $worktreeRootInput.value.trim();
+  const useWorktree = $useWorktreeInput.checked;
+  const createDraftPr = $createDraftPrInput.checked;
+  const issueNumber = issueNumberRaw ? Number.parseInt(issueNumberRaw, 10) : null;
+
   $promptInput.value = '';
   autoResize($promptInput);
   appendMessage('user', prompt);
+  const workflowNotes = [];
+  if (issueTitle) workflowNotes.push(`issue "${issueTitle}"`);
+  if (issueNumber) workflowNotes.push(`#${issueNumber}`);
+  if (repoName) workflowNotes.push(repoName);
+  if (useWorktree) workflowNotes.push('isolated worktree');
+  if (createDraftPr) workflowNotes.push('draft PR');
   appendMessage(
     'assistant',
-    'queued as background job. watch the jobs panel for progress, approvals, verifier status, and resume events.',
+    `queued as background job${workflowNotes.length ? ` for ${workflowNotes.join(' • ')}` : ''}. watch the jobs panel for progress, approvals, verifier status, and resume events.`,
     { model: $modelInput.value || $modelBadge.textContent }
   );
 
   try {
+    const payload = { prompt, session_id: sessionId };
+    if (issueTitle) payload.issue_title = issueTitle;
+    if (Number.isInteger(issueNumber) && issueNumber > 0) payload.issue_number = issueNumber;
+    if (repoName) payload.repo_name = repoName;
+    if (useWorktree) payload.use_worktree = true;
+    if (worktreeRootDir) payload.worktree_root_dir = worktreeRootDir;
+    if (createDraftPr) payload.create_draft_pr = true;
+
     const res = await fetch('/api/jobs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt, session_id: sessionId }),
+      body: JSON.stringify(payload),
     });
     const data = await res.json();
     if (!res.ok) {
@@ -1716,10 +2005,11 @@ document.querySelectorAll('.provider-btn').forEach(btn => {
 // Init
 // ---------------------------------------------------------------------------
 (async () => {
-  await Promise.all([checkHealth(), loadConfig(), loadJobs(), loadApprovals(), loadActivity()]);
+  await Promise.all([checkHealth(), loadConfig(), loadJobs(), loadApprovals(), loadActivity(), loadTraces()]);
   jobsPollHandle = window.setInterval(loadJobs, 5000);
   approvalsPollHandle = window.setInterval(loadApprovals, 5000);
   activityPollHandle = window.setInterval(loadActivity, 5000);
+  tracesPollHandle = window.setInterval(loadTraces, 5000);
   $promptInput.focus();
 })();
 </script>

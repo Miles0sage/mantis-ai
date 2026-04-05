@@ -1,7 +1,8 @@
 import asyncio
+import copy
 import time
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from mantis.core.context_manager import ContextManager
 from mantis.core.hooks import HookManager
@@ -19,6 +20,7 @@ class AgentResult:
     status: str
     duration_ms: float
     token_usage: dict
+    metadata: dict[str, Any]
 
 
 class AgentSpawner:
@@ -58,19 +60,56 @@ class AgentSpawner:
             max_budget_usd=src.max_budget_usd,
         )
 
-    async def spawn(self, task: str, system_prompt: str | None = None, agent_id: str | None = None) -> AgentResult:
+    def _build_worker_registry(self, default_bash_cwd: str | None = None) -> ToolRegistry:
+        registry = ToolRegistry()
+        for tool in self.tool_registry.list_all():
+            parameters = copy.deepcopy(tool.parameters)
+            handler = tool.handler
+
+            if tool.name == "run_bash" and default_bash_cwd:
+                properties = parameters.setdefault("properties", {})
+                properties.setdefault(
+                    "cwd",
+                    {"type": "string", "description": "Optional working directory for the command"},
+                )
+
+                async def run_bash_with_cwd(
+                    command: str,
+                    timeout: int = 120,
+                    cwd: str | None = None,
+                    _handler=tool.handler,
+                    _default_cwd=default_bash_cwd,
+                ):
+                    return await _handler(command=command, timeout=timeout, cwd=cwd or _default_cwd)
+
+                handler = run_bash_with_cwd
+
+            registry.register(tool.name, tool.description, parameters, handler)
+        return registry
+
+    async def spawn(
+        self,
+        task: str,
+        system_prompt: str | None = None,
+        agent_id: str | None = None,
+        default_bash_cwd: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        repeated_tool_call_limit: int = 2,
+    ) -> AgentResult:
         if agent_id is None:
             agent_id = f"subagent_{int(time.time() * 1000)}"
 
         start_time = time.time()
         query_engine = QueryEngine(
             model_adapter=self._clone_worker_adapter(),
-            tool_registry=self.tool_registry,
+            tool_registry=self._build_worker_registry(default_bash_cwd),
             max_iterations=8,
             context_manager=ContextManager(max_tokens=128000),
             hook_manager=HookManager(),
             permission_manager=PermissionManager(mode="yolo"),
+            repeated_tool_call_limit=repeated_tool_call_limit,
         )
+        metadata = dict(metadata or {})
 
         async def run_agent():
             try:
@@ -87,6 +126,7 @@ class AgentSpawner:
                         "output_tokens": query_engine.model_adapter.total_output_tokens,
                         "cost": query_engine.model_adapter.total_cost_usd,
                     },
+                    metadata=metadata,
                 )
                 self._agent_results[agent_id] = result
                 return result
@@ -99,6 +139,7 @@ class AgentSpawner:
                     status="failed",
                     duration_ms=duration,
                     token_usage={},
+                    metadata=metadata,
                 )
                 self._agent_results[agent_id] = result
                 return result
@@ -121,15 +162,28 @@ class AgentSpawner:
                 status="failed",
                 duration_ms=duration,
                 token_usage={},
+                metadata=metadata,
             )
             self._agent_results[agent_id] = result
         finally:
             self._active_agents.pop(agent_id, None)
         return result
 
-    async def spawn_parallel(self, tasks: List[str], system_prompt: str | None = None) -> List[AgentResult]:
+    async def spawn_parallel(
+        self,
+        tasks: List[dict[str, Any]],
+        system_prompt: str | None = None,
+        repeated_tool_call_limit: int = 2,
+    ) -> List[AgentResult]:
         coros = [
-            self.spawn(task, system_prompt=system_prompt, agent_id=f"parallel_{int(time.time() * 1000)}_{index}")
+            self.spawn(
+                task["prompt"],
+                system_prompt=system_prompt,
+                agent_id=f"parallel_{int(time.time() * 1000)}_{index}",
+                default_bash_cwd=task.get("default_bash_cwd"),
+                metadata=task.get("metadata"),
+                repeated_tool_call_limit=repeated_tool_call_limit,
+            )
             for index, task in enumerate(tasks)
         ]
         results = await asyncio.gather(*coros, return_exceptions=True)
@@ -144,6 +198,7 @@ class AgentSpawner:
                         status="failed",
                         duration_ms=0.0,
                         token_usage={},
+                        metadata={},
                     )
                 )
             else:
