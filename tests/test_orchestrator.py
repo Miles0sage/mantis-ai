@@ -353,3 +353,7 @@ async def test_orchestrator_execute_returns_worker_metadata():
     assert result.workers[0]["project_dir"] == "/tmp/wt"
     assert result.workers[0]["changed_files"] == ["app.py"]
     assert result.workers[0]["resume_metadata"]["resume_key"] == "worker-1"
+    assert result.worker_summary["worker_count"] == 1
+    assert result.worker_summary["completed_workers"] == 1
+    assert result.worker_summary["changed_files"] == ["app.py"]
+    assert result.worker_summary["total_cost"] == 0.01

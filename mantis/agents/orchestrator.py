@@ -32,6 +32,7 @@ class OrchestrationResult:
     worker_outputs: list[str]
     verification: VerificationResult
     workers: list[dict[str, Any]]
+    worker_summary: dict[str, Any]
     revised: bool = False
 
 
@@ -83,6 +84,7 @@ class CoordinatorOrchestrator:
             worker_outputs=worker_outputs,
             verification=verification,
             workers=self._summarize_workers(self._last_worker_results),
+            worker_summary=self._summarize_worker_metrics(self._last_worker_results),
             revised=revised,
         )
 
@@ -251,6 +253,36 @@ class CoordinatorOrchestrator:
                 }
             )
         return workers
+
+    def _summarize_worker_metrics(self, results: list[Any]) -> dict[str, Any]:
+        changed_files: list[str] = []
+        total_cost = 0.0
+        total_duration_ms = 0.0
+        completed = 0
+        failed = 0
+
+        for result in results:
+            metadata = result.metadata or {}
+            for path in metadata.get("changed_files") or []:
+                if path not in changed_files:
+                    changed_files.append(path)
+            total_duration_ms += float(result.duration_ms or 0.0)
+            cost = (result.token_usage or {}).get("cost")
+            if cost is not None:
+                total_cost += float(cost)
+            if result.status == "completed":
+                completed += 1
+            else:
+                failed += 1
+
+        return {
+            "worker_count": len(results),
+            "completed_workers": completed,
+            "failed_workers": failed,
+            "changed_files": changed_files,
+            "total_duration_ms": round(total_duration_ms, 2),
+            "total_cost": round(total_cost, 6),
+        }
 
     def _build_resume_metadata(
         self,

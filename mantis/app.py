@@ -527,6 +527,7 @@ class MantisApp:
                     "revised": orchestration.revised,
                 },
                 "workers": orchestration.workers,
+                "worker_summary": orchestration.worker_summary,
             }
         else:
             response = await self.query_engine.run_agentic(prompt, system_prompt=system_prompt)

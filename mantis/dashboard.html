@@ -1242,6 +1242,8 @@ function renderJobs(jobs) {
       job.execution_mode ? { cls: 'badge badge-type', text: job.execution_mode === 'coordinator_worker_verifier' ? 'coord+verify' : job.execution_mode } : null,
       job.verification?.verdict ? { cls: `badge badge-model`, text: `verifier ${job.verification.verdict}` } : null,
       Array.isArray(job.workers) && job.workers.length ? { cls: 'badge badge-tasks', text: `${job.workers.length} workers` } : null,
+      job.worker_summary?.changed_files?.length ? { cls: 'badge badge-tasks', text: `${job.worker_summary.changed_files.length} changed` } : null,
+      job.review_bundle?.title ? { cls: 'badge badge-model', text: 'review bundle' } : null,
       job.pr_review?.title ? { cls: 'badge badge-model', text: 'pr bundle' } : null,
       job.worktree?.branch ? { cls: 'badge badge-type', text: `worktree ${job.worktree.branch}` } : null,
       job.context?.max_messages_dropped ? { cls: 'badge badge-tasks', text: `context -${job.context.max_messages_dropped}` } : null,
@@ -1295,11 +1297,13 @@ function renderJobDetail(job) {
   const verifier = job.verification || execution?.verifier;
   const context = job.context || execution?.context;
   const workers = job.workers || execution?.workers || [];
+  const workerSummary = job.worker_summary || execution?.worker_summary;
   const prReview = job.pr_review || execution?.pr_review;
+  const reviewBundle = job.review_bundle || execution?.review_bundle;
   const worktree = job.worktree || execution?.worktree;
   const draftPr = job.draft_pr || execution?.draft_pr;
   const taskList = job.tasks || execution?.tasks || plan?.tasks || [];
-  if (!plan && !execution && taskList.length === 0 && workers.length === 0 && !verifier && !context && !prReview && !worktree && !draftPr) return null;
+  if (!plan && !execution && taskList.length === 0 && workers.length === 0 && !workerSummary && !verifier && !context && !prReview && !reviewBundle && !worktree && !draftPr) return null;
 
   const wrap = document.createElement('div');
   wrap.className = 'job-detail';
@@ -1344,6 +1348,32 @@ function renderJobDetail(job) {
     planWrap.appendChild(row);
   });
   wrap.appendChild(planWrap);
+
+  if (workerSummary) {
+    const summaryTitle = document.createElement('div');
+    summaryTitle.className = 'job-detail-title';
+    summaryTitle.textContent = 'Worker Summary';
+    wrap.appendChild(summaryTitle);
+
+    const summaryEl = document.createElement('div');
+    summaryEl.className = 'job-verifier';
+    summaryEl.textContent = [
+      workerSummary.worker_count != null ? `${workerSummary.worker_count} workers` : null,
+      workerSummary.completed_workers != null ? `${workerSummary.completed_workers} completed` : null,
+      workerSummary.failed_workers ? `${workerSummary.failed_workers} failed` : null,
+      workerSummary.changed_files?.length ? `${workerSummary.changed_files.length} changed files` : null,
+      workerSummary.total_duration_ms != null ? `${Math.round(workerSummary.total_duration_ms)}ms total` : null,
+      workerSummary.total_cost != null ? `$${Number(workerSummary.total_cost).toFixed(4)}` : null,
+    ].filter(Boolean).join(' · ');
+    wrap.appendChild(summaryEl);
+
+    if (workerSummary.changed_files?.length) {
+      const changedEl = document.createElement('pre');
+      changedEl.className = 'approval-preview';
+      changedEl.textContent = workerSummary.changed_files.join('\n');
+      wrap.appendChild(changedEl);
+    }
+  }
 
   if (workers.length) {
     const workersTitle = document.createElement('div');
@@ -1454,6 +1484,31 @@ function renderJobDetail(job) {
       diffEl.className = 'approval-preview';
       diffEl.textContent = prReview.diff_preview;
       wrap.appendChild(diffEl);
+    }
+  }
+
+  if (reviewBundle) {
+    const bundleTitle = document.createElement('div');
+    bundleTitle.className = 'job-detail-title';
+    bundleTitle.textContent = 'Review Bundle';
+    wrap.appendChild(bundleTitle);
+
+    const bundleEl = document.createElement('div');
+    bundleEl.className = `job-verifier ${(reviewBundle.verdict || 'pass').toLowerCase()}`;
+    bundleEl.textContent = [
+      reviewBundle.title ? `title ${reviewBundle.title}` : null,
+      reviewBundle.branch ? `branch ${reviewBundle.branch}` : null,
+      reviewBundle.worker_count != null ? `${reviewBundle.worker_count} workers` : null,
+      reviewBundle.changed_files?.length ? `${reviewBundle.changed_files.length} files` : null,
+      reviewBundle.verdict ? `verdict ${reviewBundle.verdict}` : null,
+    ].filter(Boolean).join(' · ');
+    wrap.appendChild(bundleEl);
+
+    if (reviewBundle.body) {
+      const bundleBodyEl = document.createElement('pre');
+      bundleBodyEl.className = 'approval-preview';
+      bundleBodyEl.textContent = reviewBundle.body;
+      wrap.appendChild(bundleBodyEl);
     }
   }
 

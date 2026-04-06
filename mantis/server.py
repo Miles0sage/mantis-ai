@@ -247,9 +247,46 @@ def _extract_execution_summary(stats: dict[str, Any] | None) -> dict[str, Any]:
         "verification": execution.get("verifier"),
         "context": execution.get("context"),
         "workers": execution.get("workers"),
+        "worker_summary": execution.get("worker_summary"),
         "pr_review": execution.get("pr_review"),
+        "review_bundle": execution.get("review_bundle"),
         "worktree": execution.get("worktree"),
         "draft_pr": execution.get("draft_pr"),
+    }
+
+
+def _build_review_bundle_payload(
+    *,
+    prompt: str,
+    response: str | None,
+    stats: dict[str, Any] | None,
+    git_review: dict[str, Any] | None,
+    issue_title: str | None = None,
+    issue_number: int | None = None,
+) -> dict[str, Any]:
+    from mantis.cli import build_pr_review_bundle
+
+    stats = stats or {}
+    execution = stats.get("execution") or {}
+    verification = execution.get("verifier") or {}
+    worker_summary = execution.get("worker_summary") or {}
+    changed_files = list((git_review or {}).get("changed_files") or worker_summary.get("changed_files") or [])
+    title = issue_title or prompt.strip().splitlines()[0][:120] or "Mantis change bundle"
+    body = build_pr_review_bundle(
+        title,
+        response or "",
+        stats=stats,
+        issue_number=issue_number,
+        git_review=git_review,
+    )
+    return {
+        "title": f"[Issue #{issue_number}] {title}" if issue_number is not None else title,
+        "body": body,
+        "changed_files": changed_files,
+        "verdict": verification.get("verdict"),
+        "reason": verification.get("reason"),
+        "branch": (git_review or {}).get("branch"),
+        "worker_count": worker_summary.get("worker_count"),
     }
 
 
@@ -277,7 +314,9 @@ def _serialize_job(job: Any) -> dict[str, Any]:
     payload["execution_mode"] = execution.get("execution_mode")
     payload["context"] = execution.get("context")
     payload["workers"] = execution.get("workers") or metadata.get("workers")
+    payload["worker_summary"] = execution.get("worker_summary") or metadata.get("worker_summary")
     payload["pr_review"] = execution.get("pr_review") or metadata.get("pr_review")
+    payload["review_bundle"] = execution.get("review_bundle") or metadata.get("review_bundle")
     payload["worktree"] = execution.get("worktree") or metadata.get("worktree")
     payload["draft_pr"] = execution.get("draft_pr") or metadata.get("draft_pr")
     payload["approval"] = approval
@@ -546,6 +585,17 @@ async def create_background_job(body: BackgroundJobRequest):
                         "branch": git_review.get("branch"),
                         "path": git_review.get("path"),
                     }
+                review_bundle = None
+                if worktree_meta or execution.get("workers"):
+                    review_bundle = _build_review_bundle_payload(
+                        prompt=body.prompt,
+                        response=response,
+                        stats=app_instance.last_stats,
+                        git_review=git_review,
+                        issue_title=body.issue_title,
+                        issue_number=body.issue_number,
+                    )
+                    execution["review_bundle"] = review_bundle
                 if body.issue_title:
                     verifier = execution.get("verifier") or {}
                     changed_files = list((git_review or {}).get("changed_files") or [])
@@ -560,28 +610,12 @@ async def create_background_job(body: BackgroundJobRequest):
                         "verdict": verifier.get("verdict"),
                         "reason": verifier.get("reason"),
                         "diff_preview": (git_review or {}).get("diff"),
+                        "body": (review_bundle or {}).get("body"),
                     }
                     if body.create_draft_pr:
                         branch = (git_review or {}).get("branch")
                         if branch:
-                            pr_lines = [
-                                f"PR title: {execution['pr_review']['title']}",
-                                "",
-                                "Changed files:",
-                            ]
-                            if changed_files:
-                                pr_lines.extend(f"- {path}" for path in changed_files)
-                            else:
-                                pr_lines.append("- (no tracked file targets)")
-                            pr_lines.extend(
-                                [
-                                    "",
-                                    "Verification:",
-                                    f"- verdict: {verifier.get('verdict') or 'unknown'}",
-                                    f"- reason: {verifier.get('reason') or 'not recorded'}",
-                                ]
-                            )
-                            pr_body = "\n".join(pr_lines)
+                            pr_body = execution["pr_review"].get("body") or ""
                             try:
                                 pr_url = _create_draft_pr_with_gh(
                                     execution["pr_review"]["title"],

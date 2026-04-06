@@ -13,7 +13,9 @@ def test_extract_execution_summary_flattens_execution_payload():
             "verifier": {"verdict": "pass", "reason": "All checks passed."},
             "context": {"max_messages_dropped": 2},
             "workers": [{"agent_id": "worker-1", "title": "task one", "changed_files": ["app.py"], "diff_preview": "diff --git", "resume_metadata": {"resume_key": "worker-1", "prompt": "fix app", "execution_prompt": "fix app", "resumable": True}}],
+            "worker_summary": {"worker_count": 1, "completed_workers": 1, "changed_files": ["app.py"], "total_cost": 0.01},
             "pr_review": {"title": "Add retry flow", "verdict": "pass"},
+            "review_bundle": {"title": "Add retry flow", "body": "bundle"},
             "worktree": {"branch": "mantis/issue-12-add-retry-flow", "path": "/tmp/wt"},
             "draft_pr": {"status": "created", "url": "https://github.com/acme/api/pull/12"},
         }
@@ -27,8 +29,10 @@ def test_extract_execution_summary_flattens_execution_payload():
     assert summary["context"]["max_messages_dropped"] == 2
     assert summary["workers"][0]["agent_id"] == "worker-1"
     assert summary["workers"][0]["changed_files"] == ["app.py"]
+    assert summary["worker_summary"]["worker_count"] == 1
     assert summary["workers"][0]["resume_metadata"]["resume_key"] == "worker-1"
     assert summary["pr_review"]["title"] == "Add retry flow"
+    assert summary["review_bundle"]["body"] == "bundle"
     assert summary["worktree"]["branch"] == "mantis/issue-12-add-retry-flow"
     assert summary["draft_pr"]["status"] == "created"
 
@@ -47,7 +51,9 @@ def test_serialize_job_exposes_top_level_verification_and_tasks():
                     "verifier": {"verdict": "pass", "reason": "Verified."},
                     "context": {"last_trim": {"messages_dropped": 1}},
                     "workers": [{"agent_id": "worker-1", "worktree": {"branch": "mantis/task-1"}, "changed_files": ["app/service.py"], "diff_preview": "diff --git", "resume_metadata": {"resume_key": "worker-1", "prompt": "fix service", "execution_prompt": "fix service", "resumable": True}}],
+                    "worker_summary": {"worker_count": 1, "completed_workers": 1, "changed_files": ["app/service.py"], "total_cost": 0.01},
                     "pr_review": {"title": "Retry flow", "changed_files": ["app/service.py"]},
+                    "review_bundle": {"title": "Retry flow", "body": "bundle body"},
                     "worktree": {"branch": "mantis/issue-12-retry-flow", "path": "/tmp/wt"},
                     "draft_pr": {"status": "created", "url": "https://github.com/acme/api/pull/22"},
                 },
@@ -63,10 +69,37 @@ def test_serialize_job_exposes_top_level_verification_and_tasks():
     assert payload["context"]["last_trim"]["messages_dropped"] == 1
     assert payload["workers"][0]["worktree"]["branch"] == "mantis/task-1"
     assert payload["workers"][0]["changed_files"] == ["app/service.py"]
+    assert payload["worker_summary"]["changed_files"] == ["app/service.py"]
     assert payload["workers"][0]["resume_metadata"]["resumable"] is True
     assert payload["pr_review"]["title"] == "Retry flow"
+    assert payload["review_bundle"]["body"] == "bundle body"
     assert payload["worktree"]["branch"] == "mantis/issue-12-retry-flow"
     assert payload["draft_pr"]["status"] == "created"
+
+
+def test_build_review_bundle_payload_includes_verification_and_changed_files():
+    from mantis.server import _build_review_bundle_payload
+
+    payload = _build_review_bundle_payload(
+        prompt="Fix retry flow in app/service.py",
+        response="Updated retry handling and tests.",
+        stats={
+            "execution": {
+                "verifier": {"verdict": "pass", "reason": "Verified."},
+                "tasks": [{"file_targets": ["app/service.py", "tests/test_service.py"]}],
+                "worker_summary": {"worker_count": 2, "changed_files": ["app/service.py"]},
+            }
+        },
+        git_review={"branch": "mantis/issue-22", "changed_files": ["app/service.py"], "diff": "diff --git"},
+        issue_title="Retry flow",
+        issue_number=22,
+    )
+
+    assert payload["title"] == "[Issue #22] Retry flow"
+    assert payload["changed_files"] == ["app/service.py"]
+    assert payload["verdict"] == "pass"
+    assert payload["branch"] == "mantis/issue-22"
+    assert "PR title: [Issue #22] Retry flow" in payload["body"]
 
 
 def test_serialize_job_exposes_approval_and_resume_summary():
